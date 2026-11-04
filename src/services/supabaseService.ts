@@ -5943,26 +5943,6 @@ export const supabaseService = {
       console.error('Error en deleteMembreteAlcaldia:', err);
       return { success: false, error: err?.message || 'Error al eliminar el membrete' };
     }
-  },
-
-  async getGlobalMembreteUrl(): Promise<string | null> {
-    try {
-      if (typeof localStorage !== 'undefined') {
-        const custom = localStorage.getItem('alcaldia_quibdo_custom_membrete_url');
-        if (custom) return custom;
-      }
-
-      const { data: files } = await supabase.storage.from('anexos').list('membretes');
-      if (files && files.length > 0) {
-        const valid = files.filter(f => !f.name.startsWith('.'));
-        if (valid.length > 0) {
-          const { data: pUrl } = supabase.storage.from('anexos').getPublicUrl(`membretes/${valid[0].name}`);
-          if (pUrl?.publicUrl) return `${pUrl.publicUrl}?t=${Date.now()}`;
-        }
-      }
-    } catch (e) {}
-
-    return null;
   }
 };
 
