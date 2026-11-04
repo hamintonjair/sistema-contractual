@@ -1,0 +1,5983 @@
+import { supabase, SUPABASE_CONFIG } from '../lib/supabase';
+import { Secretaria, ReportData, InformeSummary, EstadoInforme, AuthUser, UserRole, Anexo, FieldComment, CertificadoSupervisionData, createDefaultCertificadoData, createDefaultFiduciariaData, createDefaultAutorizacionDesembolsoData, Obligacion, Notificacion, extractContratoNroOnly, InformeFinalData, ContratoContratista } from '../types';
+import { formatColombianCurrency, formatValorAdicion, formatPlazoLetraYNumero, parsePlazoComponents, formatDateSlash, formatFechaAplicacion } from '../utils/formatters';
+import { isMainReportComment } from '../utils/commentUtils';
+import { limpiarNumeroMoneda, formatearNumeroTablaCol } from '../utils/paymentPlanUtils';
+import { convertirNumeroALetras } from '../utils/numberToWords';
+import { sanitizeCertificadoData, isLegacyMockSocialSecurity } from '../utils/securitySocialUtils';
+
+const STORAGE_USERS_KEY = 'alcaldia_quibdo_registered_users';
+const STORAGE_PASSWORDS_KEY = 'alcaldia_quibdo_user_passwords';
+const STORAGE_SECRETARIAS_KEY = 'alcaldia_quibdo_registered_secretarias';
+
+// Validar formato UUID estándar de PostgreSQL
+const isUuid = (val?: string): boolean => {
+  if (!val) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+};
+
+// Helper genérico para insertar en cualquier tabla garantizando UUID y tolerando columnas inexistentes (PGRST204)
+const executeSafeInsert = async (tableName: string, payload: any) => {
+  const payloadToTry: any = { ...payload };
+  // Siempre asegurar un UUID válido para la clave primaria 'id' si no viene definida
+  if (!payloadToTry.id || !isUuid(payloadToTry.id)) {
+    payloadToTry.id = crypto.randomUUID();
+  }
+
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const res = await supabase.from(tableName).insert([payloadToTry]).select('*').maybeSingle();
+    if (!res.error) {
+      return res;
+    }
+
+    // 1. Manejo de columnas inexistentes reportadas por PostgREST (PGRST204)
+    if (res.error.code === 'PGRST204' || res.error.message?.includes('Could not find the')) {
+      const match = res.error.message?.match(/Could not find the '([^']+)' column/i);
+      if (match && match[1] && payloadToTry.hasOwnProperty(match[1])) {
+        delete payloadToTry[match[1]];
+        continue;
+      }
+    }
+
+    // 2. Manejo de columnas comunes que pueden no existir en la BD
+    if (payloadToTry.updated_at && res.error.message?.toLowerCase().includes('updated_at')) {
+      delete payloadToTry.updated_at;
+      continue;
+    }
+    if (payloadToTry.password && res.error.message?.toLowerCase().includes('password')) {
+      delete payloadToTry.password;
+      continue;
+    }
+    if (payloadToTry.created_at && res.error.message?.toLowerCase().includes('created_at')) {
+      delete payloadToTry.created_at;
+      continue;
+    }
+    if (payloadToTry.activo !== undefined && res.error.message?.toLowerCase().includes('activo')) {
+      delete payloadToTry.activo;
+      continue;
+    }
+
+    // Si el error fue por falta de 'id' (error 23502), generar y reintentar
+    if (res.error.code === '23502' && res.error.message?.includes('"id"')) {
+      payloadToTry.id = crypto.randomUUID();
+      continue;
+    }
+
+    return res;
+  }
+
+  return await supabase.from(tableName).insert([payloadToTry]).select('*').maybeSingle();
+};
+
+// Helper genérico para actualizar tolerando columnas inexistentes (PGRST204)
+const executeSafeUpdate = async (tableName: string, payload: any, id: string) => {
+  const payloadToTry: any = { ...payload };
+  // Nunca intentar actualizar la columna 'id'
+  delete payloadToTry.id;
+
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const res = await supabase.from(tableName).update(payloadToTry).eq('id', id).select('*').maybeSingle();
+    if (!res.error) {
+      return res;
+    }
+
+    // 1. Manejo de columnas inexistentes reportadas por PostgREST (PGRST204)
+    if (res.error.code === 'PGRST204' || res.error.message?.includes('Could not find the')) {
+      const match = res.error.message?.match(/Could not find the '([^']+)' column/i);
+      if (match && match[1] && payloadToTry.hasOwnProperty(match[1])) {
+        delete payloadToTry[match[1]];
+        continue;
+      }
+    }
+
+    // 2. Manejo de columnas comunes
+    if (payloadToTry.updated_at && res.error.message?.toLowerCase().includes('updated_at')) {
+      delete payloadToTry.updated_at;
+      continue;
+    }
+    if (payloadToTry.password && res.error.message?.toLowerCase().includes('password')) {
+      delete payloadToTry.password;
+      continue;
+    }
+    if (payloadToTry.created_at && res.error.message?.toLowerCase().includes('created_at')) {
+      delete payloadToTry.created_at;
+      continue;
+    }
+
+    return res;
+  }
+
+  return await supabase.from(tableName).update(payloadToTry).eq('id', id).select('*').maybeSingle();
+};
+
+// Helpers específicos para 'profiles'
+const executeProfileInsert = async (profilePayload: any) => {
+  return executeSafeInsert('profiles', profilePayload);
+};
+
+const executeProfileUpdate = async (profilePayload: any, id: string) => {
+  return executeSafeUpdate('profiles', profilePayload, id);
+};
+
+// Helper para obtener comentarios por campo almacenados
+const getStoredComments = (docKey?: string, informeNro?: string): Record<string, FieldComment> => {
+  if (typeof localStorage === 'undefined') return {};
+  try {
+    if (docKey && informeNro) {
+      const raw = localStorage.getItem(`informe_comentarios_${docKey}_${informeNro}`) || 
+                  localStorage.getItem(`informe_comments_${docKey}_${informeNro}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Object.keys(parsed).length > 0) return parsed;
+      }
+      const rawData = localStorage.getItem(`informe_data_${docKey}_${informeNro}`) || 
+                      localStorage.getItem(`alcaldia_quibdo_report_${docKey}_${informeNro}`);
+      if (rawData) {
+        const parsed = JSON.parse(rawData);
+        if (parsed?.comentariosCampos && Object.keys(parsed.comentariosCampos).length > 0) {
+          return parsed.comentariosCampos;
+        }
+      }
+      // CRITICAL: When docKey is present, do NOT fall back to global keys.
+      // This prevents Contractor B from loading Contractor A's comments (as they share the same informeNro).
+      return {};
+    }
+    if (informeNro) {
+      const raw = localStorage.getItem(`informe_comentarios_${informeNro}`) || 
+                  localStorage.getItem(`informe_comments_${informeNro}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Object.keys(parsed).length > 0) return parsed;
+      }
+      const rawData = localStorage.getItem(`informe_data_${informeNro}`) || 
+                      localStorage.getItem(`alcaldia_quibdo_report_${informeNro}`);
+      if (rawData) {
+        const parsed = JSON.parse(rawData);
+        if (parsed?.comentariosCampos && Object.keys(parsed.comentariosCampos).length > 0) {
+          return parsed.comentariosCampos;
+        }
+      }
+    }
+  } catch (e) {}
+  return {};
+};
+
+// Helper para obtener informe completo almacenado
+const getStoredReportData = (docKey?: string, informeNro?: string): Partial<ReportData> | null => {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    if (docKey && informeNro) {
+      const raw = localStorage.getItem(`informe_data_${docKey}_${informeNro}`) ||
+                  localStorage.getItem(`alcaldia_quibdo_report_${docKey}_${informeNro}`);
+      if (raw) return JSON.parse(raw);
+      // DO NOT fall back to global keys when docKey is provided!
+      return null;
+    }
+    if (informeNro) {
+      const raw = localStorage.getItem(`informe_data_${informeNro}`) ||
+                  localStorage.getItem(`alcaldia_quibdo_report_${informeNro}`);
+      if (raw) return JSON.parse(raw);
+    }
+  } catch (e) {}
+  return null;
+};
+
+// Helper para asociar hasta 5 fotos por obligación de forma consistente con respaldo posicional y textual
+const associateFotosToObligaciones = (obligaciones: Obligacion[], anexos: Anexo[], storedObs?: Obligacion[]): { obsWithFotos: Obligacion[]; allAnexos: Anexo[] } => {
+  const allAnexos = [...anexos];
+  const assignedAnexosIds = new Set<string>();
+
+  const obsWithFotos = obligaciones.map((obs, idx) => {
+    const targetObligacionNumber = idx + 1;
+    // 1. Priorizar la búsqueda de fotos coincidentes en la base de datos (Supabase)
+    const matchedDb = allAnexos.filter(a => {
+      if (assignedAnexosIds.has(a.id)) return false;
+      if (a.obligacionId && a.obligacionId === obs.id) return true;
+      if (a.obligacionIndex !== undefined && a.obligacionIndex === targetObligacionNumber) return true;
+      
+      const t = (a.titulo || '').toLowerCase();
+      // Extraer número de obligación con regex estricta:
+      // Coincide con: "obligación #1", "obligacion # 1", "obligación 1", "obl #1", "obligación n° 1", "[obligación 1]", etc.
+      // IMPORTANTE: Requiere coincidencia numérica exacta (\d+) para evitar que "Obligación #1" coincida con #10, #11, #12, etc.
+      const match = t.match(/(?:obligaci[oó]n|obl)\s*(?:#|n°|nº|n\b|\s)?\s*(\d+)/i);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        return num === targetObligacionNumber;
+      }
+      return false;
+    });
+
+    // 2. Buscar borradores locales pendientes de subida en localStorage (como imágenes data:image)
+    const stored = storedObs?.find(so => so.id === obs.id || so.descripcion === obs.descripcion);
+    const localDrafts = (stored?.fotos || []).filter(f => {
+      const url = f.imagenUrl || '';
+      return f.file || url.startsWith('data:') || f.isPendingUpload;
+    });
+
+    // Combinar priorizando la base de datos (con URLs públicas de producción) y luego borradores locales
+    const combined = [...matchedDb, ...localDrafts].slice(0, 5);
+
+    // Registrar IDs asignados para evitar duplicación
+    combined.forEach(f => {
+      if (f.id) assignedAnexosIds.add(f.id);
+    });
+
+    const finalFotos = combined.map((f, fIdx) => ({
+      ...f,
+      obligacionId: obs.id,
+      obligacionIndex: targetObligacionNumber,
+      titulo: f.titulo || `Evidencia fotográfica ${fIdx + 1} - Obligación #${targetObligacionNumber}`
+    }));
+
+    return {
+      ...obs,
+      fotos: finalFotos
+    };
+  });
+
+  const flatAnexos: Anexo[] = [];
+  obsWithFotos.forEach(obs => {
+    if (obs.fotos && obs.fotos.length > 0) {
+      flatAnexos.push(...obs.fotos);
+    }
+  });
+
+  allAnexos.forEach(a => {
+    if (!flatAnexos.some(fa => fa.id === a.id || fa.imagenUrl === a.imagenUrl)) {
+      flatAnexos.push(a);
+    }
+  });
+
+  return { obsWithFotos, allAnexos: flatAnexos };
+};
+
+// Helpers para codificar/decodificar observaciones, comentarios por campo y texto de certificación sin requerir migraciones de BD
+const parseObservacionesAndComments = (rawObs?: string): { 
+  cleanObs: string; 
+  comments: Record<string, FieldComment>; 
+  valorPagarText?: string;
+  plazoText?: string;
+  valorMensualText?: string;
+  fechaRegistroPresupuestalText?: string;
+  codigoRubroText?: string;
+  numeroCuentaText?: string;
+  bancoText?: string;
+  tipoCuentaText?: string;
+  ciudadText?: string;
+} => {
+  if (!rawObs) return { cleanObs: '', comments: {} };
+  let current = rawObs;
+  let comments: Record<string, FieldComment> = {};
+  let valorPagarText: string | undefined;
+  let plazoText: string | undefined;
+  let valorMensualText: string | undefined;
+  let fechaRegistroPresupuestalText: string | undefined;
+  let codigoRubroText: string | undefined;
+  let numeroCuentaText: string | undefined;
+  let bancoText: string | undefined;
+  let tipoCuentaText: string | undefined;
+  let ciudadText: string | undefined;
+
+  // 1. Extraer __COMMENTS_JSON__: si existe
+  if (current.includes('__COMMENTS_JSON__ :') || current.includes('__COMMENTS_JSON__:')) {
+    const isSpaced = current.includes('__COMMENTS_JSON__ :');
+    const marker = isSpaced ? '__COMMENTS_JSON__ :' : '__COMMENTS_JSON__:';
+    const idx = current.indexOf(marker);
+    const afterComments = current.slice(idx + marker.length);
+    const rawJson = afterComments.split('__')[0].trim();
+    try {
+      comments = JSON.parse(rawJson);
+    } catch (e) {
+      console.warn('Error parsing __COMMENTS_JSON__:', e);
+    }
+    current = current.slice(0, idx) + afterComments.slice(rawJson.length);
+  }
+
+  // 2. Extraer __VALOR_PAGAR__: si existe
+  if (current.includes('__VALOR_PAGAR__:')) {
+    const idx = current.indexOf('__VALOR_PAGAR__:');
+    const afterVp = current.slice(idx + '__VALOR_PAGAR__:'.length);
+    const rawVp = afterVp.split('__')[0].trim();
+    try {
+      valorPagarText = decodeURIComponent(rawVp);
+    } catch (e) {
+      valorPagarText = rawVp;
+    }
+    current = current.slice(0, idx) + afterVp.slice(rawVp.length);
+  }
+
+  // 3. Extraer __PLAZO__: si existe
+  if (current.includes('__PLAZO__:')) {
+    const idx = current.indexOf('__PLAZO__:');
+    const afterPl = current.slice(idx + '__PLAZO__:'.length);
+    const rawPl = afterPl.split('__')[0].trim();
+    try {
+      plazoText = decodeURIComponent(rawPl);
+    } catch (e) {
+      plazoText = rawPl;
+    }
+    current = current.slice(0, idx) + afterPl.slice(rawPl.length);
+  }
+
+  // 4. Extraer __VALOR_MENSUAL__: si existe
+  if (current.includes('__VALOR_MENSUAL__:')) {
+    const idx = current.indexOf('__VALOR_MENSUAL__:');
+    const afterVm = current.slice(idx + '__VALOR_MENSUAL__:'.length);
+    const rawVm = afterVm.split('__')[0].trim();
+    try {
+      valorMensualText = decodeURIComponent(rawVm);
+    } catch (e) {
+      valorMensualText = rawVm;
+    }
+    current = current.slice(0, idx) + afterVm.slice(rawVm.length);
+  }
+
+  // 5. Extraer __FECHA_REGISTRO_PRESUPUESTAL__: si existe
+  if (current.includes('__FECHA_REGISTRO_PRESUPUESTAL__:')) {
+    const idx = current.indexOf('__FECHA_REGISTRO_PRESUPUESTAL__:');
+    const afterFrp = current.slice(idx + '__FECHA_REGISTRO_PRESUPUESTAL__:'.length);
+    const rawFrp = afterFrp.split('__')[0].trim();
+    try {
+      fechaRegistroPresupuestalText = decodeURIComponent(rawFrp);
+    } catch (e) {
+      fechaRegistroPresupuestalText = rawFrp;
+    }
+    current = current.slice(0, idx) + afterFrp.slice(rawFrp.length);
+  }
+
+  // 6. Extraer __CODIGO_RUBRO__: si existe
+  if (current.includes('__CODIGO_RUBRO__:')) {
+    const idx = current.indexOf('__CODIGO_RUBRO__:');
+    const afterCr = current.slice(idx + '__CODIGO_RUBRO__:'.length);
+    const rawCr = afterCr.split('__')[0].trim();
+    try {
+      codigoRubroText = decodeURIComponent(rawCr);
+    } catch (e) {
+      codigoRubroText = rawCr;
+    }
+    current = current.slice(0, idx) + afterCr.slice(rawCr.length);
+  }
+
+  // 7. Extraer __NUMERO_CUENTA__: si existe
+  if (current.includes('__NUMERO_CUENTA__:')) {
+    const idx = current.indexOf('__NUMERO_CUENTA__:');
+    const afterNc = current.slice(idx + '__NUMERO_CUENTA__:'.length);
+    const rawNc = afterNc.split('__')[0].trim();
+    try {
+      numeroCuentaText = decodeURIComponent(rawNc);
+    } catch (e) {
+      numeroCuentaText = rawNc;
+    }
+    current = current.slice(0, idx) + afterNc.slice(rawNc.length);
+  }
+
+  // 8. Extraer __BANCO__: si existe
+  if (current.includes('__BANCO__:')) {
+    const idx = current.indexOf('__BANCO__:');
+    const afterB = current.slice(idx + '__BANCO__:'.length);
+    const rawB = afterB.split('__')[0].trim();
+    try {
+      bancoText = decodeURIComponent(rawB);
+    } catch (e) {
+      bancoText = rawB;
+    }
+    current = current.slice(0, idx) + afterB.slice(rawB.length);
+  }
+
+  // 9. Extraer __TIPO_CUENTA__: si existe
+  if (current.includes('__TIPO_CUENTA__:')) {
+    const idx = current.indexOf('__TIPO_CUENTA__:');
+    const afterTc = current.slice(idx + '__TIPO_CUENTA__:'.length);
+    const rawTc = afterTc.split('__')[0].trim();
+    try {
+      tipoCuentaText = decodeURIComponent(rawTc);
+    } catch (e) {
+      tipoCuentaText = rawTc;
+    }
+    current = current.slice(0, idx) + afterTc.slice(rawTc.length);
+  }
+
+  // 10. Extraer __CIUDAD__: si existe
+  if (current.includes('__CIUDAD__:')) {
+    const idx = current.indexOf('__CIUDAD__:');
+    const afterCd = current.slice(idx + '__CIUDAD__:'.length);
+    const rawCd = afterCd.split('__')[0].trim();
+    try {
+      ciudadText = decodeURIComponent(rawCd);
+    } catch (e) {
+      ciudadText = rawCd;
+    }
+    current = current.slice(0, idx) + afterCd.slice(rawCd.length);
+  }
+
+  // Limpiar saltos de línea sobrantes y posibles marcadores vacíos
+  const cleanObs = current
+    .replace(/__VALOR_PAGAR__:\s*/g, '')
+    .replace(/__PLAZO__:\s*/g, '')
+    .replace(/__VALOR_MENSUAL__:\s*/g, '')
+    .replace(/__FECHA_REGISTRO_PRESUPUESTAL__:\s*/g, '')
+    .replace(/__CODIGO_RUBRO__:\s*/g, '')
+    .replace(/__NUMERO_CUENTA__:\s*/g, '')
+    .replace(/__BANCO__:\s*/g, '')
+    .replace(/__TIPO_CUENTA__:\s*/g, '')
+    .replace(/__CIUDAD__:\s*/g, '')
+    .replace(/__COMMENTS_JSON__:\s*/g, '')
+    .replace(/__COMMENTS_JSON__\s*:\s*/g, '')
+    .trim();
+
+  return {
+    cleanObs,
+    comments,
+    valorPagarText,
+    plazoText,
+    valorMensualText,
+    fechaRegistroPresupuestalText,
+    codigoRubroText,
+    numeroCuentaText,
+    bancoText,
+    tipoCuentaText,
+    ciudadText
+  };
+};
+
+const buildObservacionesWithComments = (
+  cleanObs: string, 
+  comments?: Record<string, FieldComment>, 
+  valorPagarText?: string,
+  plazoText?: string,
+  valorMensualText?: string,
+  fechaRegistroPresupuestal?: string,
+  codigoRubro?: string,
+  numeroCuenta?: string,
+  banco?: string,
+  tipoCuenta?: string,
+  ciudad?: string
+): string => {
+  let baseObs = cleanObs || '';
+  if (valorPagarText && valorPagarText.trim()) {
+    baseObs = `${baseObs}\n\n__VALOR_PAGAR__:${encodeURIComponent(valorPagarText.trim())}`;
+  }
+  if (plazoText && plazoText.trim()) {
+    baseObs = `${baseObs}\n\n__PLAZO__:${encodeURIComponent(plazoText.trim())}`;
+  }
+  if (valorMensualText && valorMensualText.trim()) {
+    baseObs = `${baseObs}\n\n__VALOR_MENSUAL__:${encodeURIComponent(valorMensualText.trim())}`;
+  }
+  if (fechaRegistroPresupuestal && fechaRegistroPresupuestal.trim()) {
+    baseObs = `${baseObs}\n\n__FECHA_REGISTRO_PRESUPUESTAL__:${encodeURIComponent(fechaRegistroPresupuestal.trim())}`;
+  }
+  if (codigoRubro && codigoRubro.trim()) {
+    baseObs = `${baseObs}\n\n__CODIGO_RUBRO__:${encodeURIComponent(codigoRubro.trim())}`;
+  }
+  if (numeroCuenta && numeroCuenta.trim()) {
+    baseObs = `${baseObs}\n\n__NUMERO_CUENTA__:${encodeURIComponent(numeroCuenta.trim())}`;
+  }
+  if (banco && banco.trim()) {
+    baseObs = `${baseObs}\n\n__BANCO__:${encodeURIComponent(banco.trim())}`;
+  }
+  if (tipoCuenta && tipoCuenta.trim()) {
+    baseObs = `${baseObs}\n\n__TIPO_CUENTA__:${encodeURIComponent(tipoCuenta.trim())}`;
+  }
+  if (ciudad && ciudad.trim()) {
+    baseObs = `${baseObs}\n\n__CIUDAD__:${encodeURIComponent(ciudad.trim())}`;
+  }
+  if (comments && Object.keys(comments).length > 0) {
+    return `${baseObs}\n\n__COMMENTS_JSON__:${JSON.stringify(comments)}`;
+  }
+  return baseObs;
+};
+
+const mapStatusToDb = (status: EstadoInforme): string => {
+  if (status === 'Devuelto') return 'Rechazado';
+  return status;
+};
+
+const mapStatusFromDb = (dbStatus?: string, hasComments: boolean = false): EstadoInforme => {
+  if (dbStatus === 'Borrador' || dbStatus === 'borrador') return 'Borrador';
+  if (dbStatus === 'Rechazado' || dbStatus === 'Devuelto' || (hasComments && dbStatus !== 'Aprobado' && dbStatus !== 'Borrador')) {
+    return 'Devuelto';
+  }
+  return (dbStatus as EstadoInforme) || 'Enviado';
+};
+
+// Cuentas de respaldo dinámicas de la base de datos (se leen directamente de la tabla 'profiles')
+const SYSTEM_CORE_USERS: AuthUser[] = [];
+
+// Umbral mínimo entre barridos de depuración automática de informes vencidos, para no repetir esta
+// revisión (costosa: 1+ consultas por contratista) en cada recarga de la app (HMR en desarrollo, cambios
+// de pestaña, montajes repetidos) ni sobrecargar la base de datos innecesariamente.
+const RETENTION_SWEEP_MIN_INTERVAL_MS = 60 * 60 * 1000; // 1 hora
+
+export const supabaseService = {
+  // Helper: Obtener comentarios guardados por documento y número de informe
+  getStoredComments(docKey?: string, informeNro?: string): Record<string, FieldComment> {
+    return getStoredComments(docKey, informeNro);
+  },
+
+  // Helper: Guardar contraseña en almacén seguro local
+  saveUserPassword(identifier: string, pass: string) {
+    try {
+      const stored = localStorage.getItem(STORAGE_PASSWORDS_KEY);
+      const map: { [key: string]: string } = stored ? JSON.parse(stored) : {};
+      map[identifier.toLowerCase().trim()] = pass;
+      localStorage.setItem(STORAGE_PASSWORDS_KEY, JSON.stringify(map));
+    } catch (e) {}
+  },
+
+  // Helper: Obtener contraseña guardada
+  getUserPassword(identifier: string): string | undefined {
+    try {
+      const stored = localStorage.getItem(STORAGE_PASSWORDS_KEY);
+      if (!stored) return undefined;
+      const map: { [key: string]: string } = JSON.parse(stored);
+      return map[identifier.toLowerCase().trim()];
+    } catch (e) {
+      return undefined;
+    }
+  },
+
+  // 1. Probar conexión y estado de Supabase
+  async checkConnection(): Promise<{ connected: boolean; message: string; tablesCount?: number }> {
+    try {
+      const { data, error } = await supabase.from('sec_secretarias').select('count', { count: 'exact', head: true });
+      if (error) {
+        return { 
+          connected: false, 
+          message: error.message || 'Error al conectar con las tablas de Supabase' 
+        };
+      }
+      return { 
+        connected: true, 
+        message: `Conectado exitosamente a Supabase (${SUPABASE_CONFIG.url})` 
+      };
+    } catch (err: any) {
+      return { 
+        connected: false, 
+        message: err?.message || 'Fallo de conexión con el backend' 
+      };
+    }
+  },
+
+  // Helper: Resolver el UUID real de la secretaría en Supabase
+  async resolveSecretariaUuid(secIdOrCodeOrName?: string, nameFallback?: string): Promise<string | null> {
+    const param = secIdOrCodeOrName || nameFallback;
+    if (param && isUuid(param)) return param;
+
+    try {
+      if (param) {
+        const cleanCode = param.replace('sec-', '').replace('inclusion-', '');
+        const { data } = await supabase
+          .from('sec_secretarias')
+          .select('id, codigo, nombre')
+          .or(`codigo.eq.${cleanCode},nombre.ilike.%${param}%`)
+          .limit(1)
+          .maybeSingle();
+
+        if (data?.id && isUuid(data.id)) return data.id;
+      }
+
+      if (nameFallback && nameFallback !== param) {
+        const { data: nameData } = await supabase
+          .from('sec_secretarias')
+          .select('id')
+          .ilike('nombre', `%${nameFallback}%`)
+          .limit(1)
+          .maybeSingle();
+        if (nameData?.id && isUuid(nameData.id)) return nameData.id;
+      }
+
+      const { data: firstSec } = await supabase.from('sec_secretarias').select('id').limit(1).maybeSingle();
+      return (firstSec?.id && isUuid(firstSec.id)) ? firstSec.id : null;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  async resolveSecretariaId(secIdOrCodeOrName?: string, nameFallback?: string): Promise<string | null> {
+    return this.resolveSecretariaUuid(secIdOrCodeOrName, nameFallback);
+  },
+
+  // 2. Secretarías (Carga en tiempo real de Supabase)
+  async getSecretarias(): Promise<Secretaria[]> {
+    try {
+      const { data, error } = await supabase
+        .from('sec_secretarias')
+        .select('*')
+        .order('nombre', { ascending: true });
+
+      if (!error && data && data.length > 0) {
+        // Guardar copia local de respaldo
+        localStorage.setItem(STORAGE_SECRETARIAS_KEY, JSON.stringify(data));
+        return data as Secretaria[];
+      }
+    } catch (err) {
+      console.warn('Error fetching secretarias from Supabase, using local store:', err);
+    }
+
+    // Fallback a almacenamiento local si existe
+    const stored = localStorage.getItem(STORAGE_SECRETARIAS_KEY);
+    if (stored) {
+      try {
+        return JSON.parse(stored);
+      } catch (e) {}
+    }
+
+    return [
+      {
+        id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+        nombre: 'Secretaría de Inclusión y Cohesión Social',
+        nit: '891680011-0',
+        codigo: '170',
+      },
+      {
+        id: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12',
+        nombre: 'Secretaría de Hacienda y Gestión Financiera',
+        nit: '891680011-0',
+        codigo: '110',
+      },
+      {
+        id: 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13',
+        nombre: 'Secretaría de Educación Municipal',
+        nit: '891680011-0',
+        codigo: '140',
+      },
+      {
+        id: 'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380a14',
+        nombre: 'Secretaría de Infraestructura y Obras Públicas',
+        nit: '891680011-0',
+        codigo: '150',
+      },
+      {
+        id: 'e0eebc99-9c0b-4ef8-bb6d-6bb9bd380a15',
+        nombre: 'Secretaría General y de Gobierno',
+        nit: '891680011-0',
+        codigo: '120',
+      },
+      {
+        id: 'f0eebc99-9c0b-4ef8-bb6d-6bb9bd380a16',
+        nombre: 'Secretaría de Salud y Protección Social',
+        nit: '891680011-0',
+        codigo: '130',
+      }
+    ];
+  },
+
+  // 3. Gestión de archivos en Storage (Bucket: anexos)
+  async uploadImageToStorage(file: File, folder: string = 'images'): Promise<string | null> {
+    try {
+      const fileExt = file.name.split('.').pop();
+      const fileName = `${Math.random().toString(36).substring(2, 15)}_${Date.now()}.${fileExt}`;
+      const filePath = `${folder}/${fileName}`;
+
+      const { data, error } = await supabase.storage
+        .from('anexos')
+        .upload(filePath, file, {
+          cacheControl: '3600',
+          upsert: false
+        });
+
+      if (error) {
+        console.error('Error uploading image to Supabase:', error);
+        return null;
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from('anexos')
+        .getPublicUrl(filePath);
+
+      return publicUrlData.publicUrl;
+    } catch (e) {
+      console.error('Exception uploading image:', e);
+      return null;
+    }
+  },
+
+  async getGlobalMembreteUrl(): Promise<string | null> {
+    try {
+      const { data, error } = await supabase.storage
+        .from('anexos')
+        .list('membretes', {
+          limit: 1,
+          sortBy: { column: 'created_at', order: 'desc' }
+        });
+        
+      if (error || !data || data.length === 0) {
+        return null;
+      }
+      
+      const { data: publicUrlData } = supabase.storage
+        .from('anexos')
+        .getPublicUrl(`membretes/${data[0].name}`);
+        
+      return publicUrlData.publicUrl;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  async deleteImageFromStorage(imageUrl: string): Promise<boolean> {
+    try {
+      if (!imageUrl || imageUrl.startsWith('data:image')) return true;
+
+      let filePath = imageUrl;
+      if (imageUrl.includes('/storage/v1/object/public/anexos/')) {
+        const parts = imageUrl.split('/storage/v1/object/public/anexos/');
+        filePath = parts[1] || imageUrl;
+      } else if (imageUrl.includes('/anexos/')) {
+        const parts = imageUrl.split('/anexos/');
+        filePath = parts[1] || imageUrl;
+      }
+
+      // Quitar parámetros de consulta si los hay
+      filePath = filePath.split('?')[0];
+
+      // Decodificar caracteres especiales como %20 para que coincida exactamente con el archivo original en el Storage de Supabase
+      filePath = decodeURIComponent(filePath);
+
+      const { error } = await supabase.storage
+        .from('anexos')
+        .remove([filePath]);
+
+      if (error) {
+        console.error('Error deleting image from Supabase Storage:', error);
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      console.error('Exception deleting image from storage:', e);
+      return false;
+    }
+  },
+
+  // 4. Crear Secretaría con su Administrador Oficial en Supabase
+  async createSecretariaWithAdmin(
+    secData: { nombre: string; codigo: string; nit: string },
+    adminData: { nombreCompleto: string; documentoIdentidad: string; email: string; password?: string; cargo?: string; telefono?: string }
+  ): Promise<{ success: boolean; message?: string; secretaria?: Secretaria; admin?: AuthUser }> {
+    let createdSecId: string = `sec-${secData.codigo.toLowerCase()}-${Date.now()}`;
+    let realSecRow: Secretaria | null = null;
+
+    // 1. Guardar o Buscar Secretaría en Supabase
+    try {
+      // Búsqueda por código para evitar duplicados
+      const { data: existingSec } = await supabase
+        .from('sec_secretarias')
+        .select('*')
+        .eq('codigo', secData.codigo.trim())
+        .maybeSingle();
+
+      if (existingSec) {
+        // Actualizar datos si ya existía en la BD
+        const { data: updatedSec } = await executeSafeUpdate('sec_secretarias', {
+          nombre: secData.nombre.trim(),
+          nit: secData.nit.trim(),
+          activo: true,
+          updated_at: new Date().toISOString()
+        }, existingSec.id);
+
+        if (updatedSec) {
+          createdSecId = updatedSec.id;
+          realSecRow = updatedSec as Secretaria;
+        } else {
+          createdSecId = existingSec.id;
+          realSecRow = existingSec as Secretaria;
+        }
+      } else {
+        // Insertar nueva secretaría en Supabase
+        const { data: secInserted, error: secError } = await executeSafeInsert('sec_secretarias', {
+          id: crypto.randomUUID(),
+          nombre: secData.nombre.trim(),
+          codigo: secData.codigo.trim(),
+          nit: secData.nit.trim(),
+          activo: true,
+        });
+
+        if (secInserted) {
+          createdSecId = secInserted.id;
+          realSecRow = secInserted as Secretaria;
+        } else if (secError) {
+          console.error('Supabase sec_secretarias insert error:', secError);
+          return {
+            success: false,
+            message: `Error en la BD al guardar la Secretaría: ${secError.message || 'Error de inserción'}`
+          };
+        }
+      }
+    } catch (e: any) {
+      console.error('Supabase sec_secretarias catch:', e);
+      return {
+        success: false,
+        message: `Error de conexión al guardar Secretaría: ${e.message || 'Excepción imprevista'}`
+      };
+    }
+
+    const newSec: Secretaria = realSecRow || {
+      id: createdSecId,
+      nombre: secData.nombre.trim(),
+      codigo: secData.codigo.trim(),
+      nit: secData.nit.trim(),
+      created_at: new Date().toISOString(),
+    };
+
+    const adminPassword = adminData.password?.trim() || 'Admin2026*';
+    const adminEmail = adminData.email.trim();
+    const adminDoc = adminData.documentoIdentidad.trim().replace(/\./g, '');
+    let createdAdminId = crypto.randomUUID();
+
+    // 2. Guardar o Actualizar Administrador en la tabla 'profiles' de Supabase
+    try {
+      const adminProfilePayload: any = {
+        id: createdAdminId,
+        role: 'secretaria_admin',
+        nombre_completo: adminData.nombreCompleto.trim().toUpperCase(),
+        documento_identidad: adminDoc,
+        email: adminEmail,
+        password: adminPassword,
+        telefono: adminData.telefono?.trim() || '3100000000',
+        cargo: adminData.cargo?.trim() || 'Secretaria de Despacho / Supervisora',
+        activo: true,
+      };
+
+      if (isUuid(createdSecId)) {
+        adminProfilePayload.secretaria_id = createdSecId;
+      }
+
+      // Buscar si ya existe un perfil en Supabase con este documento o correo
+      const { data: existingAdmin } = await supabase
+        .from('profiles')
+        .select('*')
+        .or(`documento_identidad.eq.${adminDoc},email.ilike.${adminEmail}`)
+        .maybeSingle();
+
+      if (existingAdmin) {
+        createdAdminId = existingAdmin.id;
+        const { data: adminUpdated, error: updAdminErr } = await executeProfileUpdate(adminProfilePayload, existingAdmin.id);
+
+        if (adminUpdated) {
+          createdAdminId = adminUpdated.id;
+        } else if (updAdminErr) {
+          console.error('Error actualizando perfil de admin:', updAdminErr);
+          return {
+            success: false,
+            message: `Error al vincular el administrador en la BD: ${updAdminErr.message}`
+          };
+        }
+      } else {
+        // Insertar nuevo usuario
+        const { data: adminInserted, error: adminErr } = await executeProfileInsert(adminProfilePayload);
+
+        if (adminInserted) {
+          createdAdminId = adminInserted.id;
+        } else if (adminErr) {
+          console.error('Supabase profile admin insert error:', adminErr);
+          return {
+            success: false,
+            message: `Error al crear el perfil administrativo en la BD: ${adminErr.message}`
+          };
+        }
+      }
+    } catch (e: any) {
+      console.error('Supabase admin catch:', e);
+      return {
+        success: false,
+        message: `Excepción al guardar Administrador en la BD: ${e.message}`
+      };
+    }
+
+    // Guardar contraseña asignada
+    this.saveUserPassword(adminEmail, adminPassword);
+    this.saveUserPassword(adminDoc, adminPassword);
+
+    const newAdmin: AuthUser = {
+      id: createdAdminId,
+      email: adminEmail,
+      password: adminPassword,
+      nombreCompleto: adminData.nombreCompleto.trim().toUpperCase(),
+      documentoIdentidad: adminDoc,
+      role: 'secretaria_admin',
+      secretariaId: createdSecId,
+      secretariaNombre: secData.nombre.trim(),
+      secretariaCodigo: secData.codigo.trim(),
+      cargo: adminData.cargo?.trim() || 'Secretaria de Despacho / Supervisora',
+      telefono: adminData.telefono?.trim() || '3100000000',
+      createdAt: new Date().toISOString(),
+    };
+
+    // Actualizar almacenamiento local
+    const storedUsers = localStorage.getItem(STORAGE_USERS_KEY);
+    const customUsers: AuthUser[] = storedUsers ? JSON.parse(storedUsers) : [];
+    const filteredUsers = customUsers.filter(u => u.id !== createdAdminId && u.documentoIdentidad !== adminDoc && u.email !== adminEmail);
+    filteredUsers.push(newAdmin);
+    localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(filteredUsers));
+
+    // Actualizar almacenamiento local de secretarías
+    const storedSecs = localStorage.getItem(STORAGE_SECRETARIAS_KEY);
+    const customSecs: Secretaria[] = storedSecs ? JSON.parse(storedSecs) : [];
+    const filteredSecs = customSecs.filter(s => s.id !== createdSecId && s.codigo !== secData.codigo.trim());
+    filteredSecs.push(newSec);
+    localStorage.setItem(STORAGE_SECRETARIAS_KEY, JSON.stringify(filteredSecs));
+
+    return { success: true, secretaria: newSec, admin: newAdmin };
+  },
+
+  // 4. Actualizar Secretaría y Administrador Oficial
+  async updateSecretariaWithAdmin(
+    secId: string,
+    secData: { nombre: string; codigo: string; nit: string },
+    adminData: { id?: string; nombreCompleto: string; documentoIdentidad: string; email: string; password?: string; cargo?: string; telefono?: string }
+  ): Promise<{ success: boolean; message?: string }> {
+    try {
+      const trimmedNombre = secData.nombre.trim();
+      const trimmedCodigo = secData.codigo.trim();
+      const trimmedNit = secData.nit.trim();
+      let realSecId = secId;
+
+      // 1. Actualizar o Insertar tabla sec_secretarias en Supabase
+      if (isUuid(secId)) {
+        const { error: secUpdErr } = await executeSafeUpdate('sec_secretarias', {
+          nombre: trimmedNombre,
+          codigo: trimmedCodigo,
+          nit: trimmedNit,
+          updated_at: new Date().toISOString()
+        }, secId);
+
+        if (secUpdErr) {
+          console.error('Error actualizando sec_secretarias por ID:', secUpdErr);
+        }
+      } else {
+        // Buscar por código o insertar en Supabase si no existía como UUID
+        const { data: existingSec } = await supabase
+          .from('sec_secretarias')
+          .select('*')
+          .eq('codigo', trimmedCodigo)
+          .maybeSingle();
+
+        if (existingSec) {
+          realSecId = existingSec.id;
+          await executeSafeUpdate('sec_secretarias', {
+            nombre: trimmedNombre,
+            nit: trimmedNit,
+            updated_at: new Date().toISOString()
+          }, existingSec.id);
+        } else {
+          const { data: newSecInserted, error: insSecErr } = await executeSafeInsert('sec_secretarias', {
+            id: crypto.randomUUID(),
+            nombre: trimmedNombre,
+            codigo: trimmedCodigo,
+            nit: trimmedNit,
+            activo: true,
+          });
+
+          if (newSecInserted) {
+            realSecId = newSecInserted.id;
+          } else if (insSecErr) {
+            console.error('Error insertando secretaria en Supabase:', insSecErr);
+          }
+        }
+      }
+
+      // 2. Actualizar almacenamiento local de secretarías
+      const storedSecs = localStorage.getItem(STORAGE_SECRETARIAS_KEY);
+      if (storedSecs) {
+        let secs: Secretaria[] = JSON.parse(storedSecs);
+        secs = secs.map(s => s.id === secId || s.codigo === trimmedCodigo ? { ...s, id: realSecId, nombre: trimmedNombre, codigo: trimmedCodigo, nit: trimmedNit } : s);
+        localStorage.setItem(STORAGE_SECRETARIAS_KEY, JSON.stringify(secs));
+      }
+
+      // 3. Actualizar o Crear Administrador en la tabla 'profiles' de Supabase
+      const adminDoc = adminData.documentoIdentidad.trim().replace(/\./g, '');
+      const adminEmail = adminData.email.trim();
+      const adminPass = adminData.password?.trim();
+
+      const profilePayload: any = {
+        role: 'secretaria_admin',
+        nombre_completo: adminData.nombreCompleto.trim().toUpperCase(),
+        documento_identidad: adminDoc,
+        email: adminEmail,
+        cargo: adminData.cargo?.trim() || 'Secretaria de Despacho / Supervisora',
+        telefono: adminData.telefono?.trim() || '3100000000',
+        updated_at: new Date().toISOString()
+      };
+
+      if (adminPass) {
+        profilePayload.password = adminPass;
+      }
+
+      if (isUuid(realSecId)) {
+        profilePayload.secretaria_id = realSecId;
+      }
+
+      // Localizar ID del perfil del admin en Supabase
+      let targetProfileId: string | null = (adminData.id && isUuid(adminData.id)) ? adminData.id : null;
+
+      if (!targetProfileId) {
+        // Intentar buscar por documento, email o por la secretaría
+        let query = supabase.from('profiles').select('id').or(`documento_identidad.eq.${adminDoc},email.ilike.${adminEmail}`);
+        
+        const { data: foundProfile } = await query.maybeSingle();
+
+        if (foundProfile) {
+          targetProfileId = foundProfile.id;
+        } else if (isUuid(realSecId)) {
+          const { data: secProfile } = await supabase
+            .from('profiles')
+            .select('id')
+            .eq('secretaria_id', realSecId)
+            .eq('role', 'secretaria_admin')
+            .maybeSingle();
+
+          if (secProfile) {
+            targetProfileId = secProfile.id;
+          }
+        }
+      }
+
+      if (targetProfileId) {
+        // Actualizar perfil en Supabase
+        const { error: updProfErr } = await executeProfileUpdate(profilePayload, targetProfileId);
+
+        if (updProfErr) {
+          console.error('Error actualizando profiles admin:', updProfErr);
+          return { success: false, message: `Error en BD al actualizar el perfil administrativo: ${updProfErr.message}` };
+        }
+      } else {
+        // Crear nuevo perfil en Supabase si no existía aún
+        profilePayload.activo = true;
+        profilePayload.password = adminPass || 'Admin2026*';
+
+        const { data: createdProf, error: insProfErr } = await executeProfileInsert(profilePayload);
+
+        if (createdProf?.id) {
+          targetProfileId = createdProf.id;
+        }
+
+        if (insProfErr) {
+          console.error('Error creando perfil administrativo en Supabase:', insProfErr);
+          return { success: false, message: `Error en BD al crear el perfil administrativo: ${insProfErr.message}` };
+        }
+      }
+
+      if (adminPass) {
+        this.saveUserPassword(adminEmail, adminPass);
+        this.saveUserPassword(adminDoc, adminPass);
+      }
+
+      // 4. Actualizar almacenamiento local de usuarios
+      const storedUsers = localStorage.getItem(STORAGE_USERS_KEY);
+      if (storedUsers) {
+        let customUsers: AuthUser[] = JSON.parse(storedUsers);
+        customUsers = customUsers.map(u => {
+          if (
+            (adminData.id && u.id === adminData.id) || 
+            (targetProfileId && u.id === targetProfileId) ||
+            (u.role === 'secretaria_admin' && (u.secretariaId === secId || u.secretariaId === realSecId || u.secretariaCodigo === trimmedCodigo))
+          ) {
+            return {
+              ...u,
+              id: targetProfileId || u.id,
+              nombreCompleto: adminData.nombreCompleto.trim().toUpperCase(),
+              documentoIdentidad: adminDoc,
+              email: adminEmail,
+              cargo: adminData.cargo?.trim() || u.cargo,
+              telefono: adminData.telefono?.trim() || u.telefono,
+              password: adminPass || u.password,
+              secretariaId: realSecId,
+              secretariaNombre: trimmedNombre,
+              secretariaCodigo: trimmedCodigo
+            };
+          }
+          return u;
+        });
+        localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(customUsers));
+      }
+
+      return { success: true };
+    } catch (e: any) {
+      console.error('Error al actualizar secretaria:', e);
+      return { success: false, message: e.message || 'Error al actualizar secretaría' };
+    }
+  },
+
+  // 5. Eliminar Secretaría de Despacho (Solo si no tiene registros vinculados)
+  async deleteSecretaria(secId: string, secCodigo: string, secNombre: string): Promise<{ success: boolean; message?: string }> {
+    try {
+      const allUsers = await this.getAllUsers();
+      const linkedContractors = allUsers.filter(
+        u => u.role === 'contratista' && (u.secretariaId === secId || u.secretariaCodigo === secCodigo || u.secretariaNombre?.toLowerCase() === secNombre.toLowerCase())
+      );
+
+      const allReports = await this.getInformes();
+      const linkedReports = allReports.filter(
+        r => r.secretariaId === secId || r.secretariaNombre?.toLowerCase() === secNombre.toLowerCase()
+      );
+
+      if (linkedContractors.length > 0 || linkedReports.length > 0) {
+        return {
+          success: false,
+          message: `No se puede eliminar la dependencia. Tiene ${linkedContractors.length} contratista(s) y ${linkedReports.length} informe(s) registrados.`
+        };
+      }
+
+      // Eliminar de Supabase si aplica
+      if (isUuid(secId)) {
+        await supabase.from('sec_secretarias').delete().eq('id', secId);
+        await supabase.from('profiles').delete().eq('secretaria_id', secId);
+      }
+
+      // Actualizar local storage secretarias
+      const storedSecs = localStorage.getItem(STORAGE_SECRETARIAS_KEY);
+      if (storedSecs) {
+        let secs: Secretaria[] = JSON.parse(storedSecs);
+        secs = secs.filter(s => s.id !== secId && s.codigo !== secCodigo);
+        localStorage.setItem(STORAGE_SECRETARIAS_KEY, JSON.stringify(secs));
+      }
+
+      // Actualizar local storage usuarios (remover administrador asignado a esta secretaría)
+      const storedUsers = localStorage.getItem(STORAGE_USERS_KEY);
+      if (storedUsers) {
+        let customUsers: AuthUser[] = JSON.parse(storedUsers);
+        customUsers = customUsers.filter(u => !(u.role === 'secretaria_admin' && (u.secretariaId === secId || u.secretariaCodigo === secCodigo)));
+        localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(customUsers));
+      }
+
+      return { success: true, message: 'Dependencia eliminada correctamente.' };
+    } catch (e: any) {
+      console.error('Error al eliminar secretaría:', e);
+      return { success: false, message: e.message || 'Error al eliminar la dependencia.' };
+    }
+  },
+
+  // 4. Obtener Contratistas y Supervisores en Tiempo Real de Supabase
+  async getContractors(secretariaId?: string): Promise<AuthUser[]> {
+    let contractorsFromDb: AuthUser[] = [];
+    try {
+      let { data, error } = await supabase
+        .from('profiles')
+        .select('*, sec_secretarias(*), contratos(*)')
+        .in('role', ['contratista', 'secretaria_admin', 'secretaria_supervisor'])
+        .order('created_at', { ascending: false });
+
+      if (error || !data || data.length === 0) {
+        const fallback = await supabase
+          .from('profiles')
+          .select('*, contratos(*)')
+          .in('role', ['contratista', 'secretaria_admin', 'secretaria_supervisor']);
+        if (!fallback.error && fallback.data) {
+          data = fallback.data;
+          error = null;
+        }
+      }
+
+      let allDbContratos: any[] = [];
+      try {
+        const { data: cData } = await supabase.from('contratos').select('*');
+        if (cData) allDbContratos = cData;
+      } catch (cErr) {}
+
+      let allDbCerts: any[] = [];
+      try {
+        const { data: certsData } = await supabase
+          .from('certificaciones_supervision')
+          .select('contratista_documento, datos_formulario, created_at')
+          .order('created_at', { ascending: false });
+        if (certsData) allDbCerts = certsData;
+      } catch (cErr) {}
+
+      let allDbInformes: any[] = [];
+      try {
+        const { data: infData } = await supabase
+          .from('informes_mensuales')
+          .select('id, contrato_id, informe_nro, observaciones, created_at')
+          .order('created_at', { ascending: false });
+        if (infData) allDbInformes = infData;
+      } catch (iErr) {}
+
+      if (!error && data && data.length > 0) {
+        const isValNro = (n?: any) => n && String(n).trim() !== '' && !/^20\d{2}$/.test(String(n));
+
+        contractorsFromDb = data.map((row: any) => {
+          const doc = row.documento_identidad || '';
+          const mail = row.email || '';
+          const cleanDoc = doc.replace(/\D/g, '');
+          const userRole = (row.role as any) || 'contratista';
+          const defaultRolePass = (userRole === 'secretaria_admin' || userRole === 'secretaria_supervisor') ? 'Supervisor2026*' : 'Contratista2026*';
+          // Obtener la contraseña asignada desde la columna en DB si existe, o desde las credenciales guardadas, o valor por defecto
+          const pass = row.password || this.getUserPassword(mail) || this.getUserPassword(doc) || this.getUserPassword(row.id) || defaultRolePass;
+          if (row.password) {
+            this.saveUserPassword(mail, row.password);
+            this.saveUserPassword(doc, row.password);
+            if (row.id) this.saveUserPassword(row.id, row.password);
+          }
+          const contList = Array.isArray(row.contratos) ? row.contratos : (row.contratos ? [row.contratos] : []);
+          const directConts = allDbContratos.filter((c: any) =>
+            (c.contratista_id && c.contratista_id === row.id) ||
+            (cleanDoc && c.contratista_id && String(c.contratista_id).replace(/\D/g, '') === cleanDoc)
+          );
+          const combinedConts = [...directConts, ...contList];
+          const cont = combinedConts.find((c: any) => c && isValNro(c.contrato_nro)) || combinedConts[0];
+          const finalContNro = (cont && isValNro(cont.contrato_nro)) ? String(cont.contrato_nro).trim() : (cont?.contrato_nro || '');
+
+          const latestCert = allDbCerts.find((c: any) => {
+            const cDoc = (c.contratista_documento || '').replace(/\D/g, '');
+            return (cleanDoc && cDoc === cleanDoc) || (doc && c.contratista_documento === doc);
+          });
+          const certForm = latestCert?.datos_formulario || {};
+
+          // Buscar último informe mensual para este contratista/contrato
+          const matchingContratoIds = new Set(combinedConts.map((c: any) => c.id).filter(Boolean));
+          const latestInf = allDbInformes.find((inf: any) => matchingContratoIds.has(inf.contrato_id));
+          const parsedInfObs = latestInf?.observaciones ? parseObservacionesAndComments(latestInf.observaciones) : null;
+
+          const finalNumeroCuenta = cont?.numero_cuenta || parsedInfObs?.numeroCuentaText || certForm?.numeroCuenta || '';
+          const finalBanco = cont?.banco || parsedInfObs?.bancoText || certForm?.banco || '';
+          const finalTipoCuenta = cont?.tipo_cuenta || parsedInfObs?.tipoCuentaText || certForm?.tipoCuenta || 'AHORRO';
+          const finalCiudad = cont?.ciudad || parsedInfObs?.ciudadText || certForm?.ciudad || '';
+          const finalFechaRegistroPresupuestal = parsedInfObs?.fechaRegistroPresupuestalText 
+            ? formatDateSlash(parsedInfObs.fechaRegistroPresupuestalText) 
+            : (certForm?.fechaRegistroPresupuestal ? formatDateSlash(certForm.fechaRegistroPresupuestal) : '');
+          const finalCodigoRubro = parsedInfObs?.codigoRubroText || certForm?.codigoRubro || '';
+
+          return {
+            id: row.id,
+            email: mail,
+            password: pass,
+            nombreCompleto: row.nombre_completo || 'USUARIO REGISTRADO',
+            documentoIdentidad: doc,
+            role: userRole,
+            secretariaId: row.secretaria_id || '',
+            secretariaNombre: row.sec_secretarias?.nombre || '',
+            secretariaCodigo: row.sec_secretarias?.codigo || '',
+            cargo: row.cargo || (userRole === 'secretaria_admin' || userRole === 'secretaria_supervisor' ? 'Supervisor / Apoyo a la Supervisión' : 'Contratista de Prestación de Servicios'),
+            telefono: row.telefono || '',
+            barrio: row.direccion || '',
+            direccion: row.direccion || '',
+            numeroCuenta: finalNumeroCuenta,
+            banco: finalBanco,
+            tipoCuenta: finalTipoCuenta,
+            ciudad: finalCiudad,
+            fechaRegistroPresupuestal: finalFechaRegistroPresupuestal,
+            codigoRubro: finalCodigoRubro,
+            contratoNro: finalContNro,
+            objetoContrato: cont?.objeto || '',
+            valorContrato: cont?.valor_contrato ? String(cont.valor_contrato) : '',
+            cdpNro: cont?.cdp_nro || certForm?.cdpNro || '',
+            crpNro: cont?.crp_nro || certForm?.crpNro || '',
+            polizaNro: cont?.poliza_nro || '',
+            fechaPoliza: cont?.fecha_aprobacion_poliza || '',
+            fechaInicio: cont?.fecha_inicio || '',
+            fechaTerminacion: cont?.fecha_terminacion || '',
+            supervisorNombre: cont?.supervisor_nombre || '',
+            supervisorDocumento: cont?.supervisor_documento || '',
+            apoyoSupervisionNombre: cont?.apoyo_supervision_nombre || '',
+            apoyoSupervisionDocumento: cont?.apoyo_supervision_documento || '',
+            createdAt: row.created_at || new Date().toISOString(),
+            isSyncedToDb: true,
+          };
+        });
+      }
+    } catch (err) {
+      console.warn('Error fetching contractors from Supabase:', err);
+    }
+
+    // SIEMPRE combinar con contratistas guardados localmente
+    const map = new Map<string, AuthUser>();
+    contractorsFromDb.forEach(c => {
+      const key = (c.documentoIdentidad || c.email || c.id).replace(/\./g, '').trim().toLowerCase();
+      if (key) map.set(key, c);
+    });
+
+    const stored = localStorage.getItem(STORAGE_USERS_KEY);
+    const customUsers: AuthUser[] = stored ? JSON.parse(stored) : [];
+    const localContractors = customUsers.filter(u => u.role === 'contratista' || u.role === 'secretaria_admin' || u.role === 'secretaria_supervisor');
+    localContractors.forEach(c => {
+      const key = (c.documentoIdentidad || c.email || c.id).replace(/\./g, '').trim().toLowerCase();
+      if (key) {
+        const existing = map.get(key);
+        const resolvedPass = c.password || existing?.password || this.getUserPassword(c.email) || this.getUserPassword(c.documentoIdentidad) || (c.role === 'secretaria_admin' || c.role === 'secretaria_supervisor' ? 'Supervisor2026*' : 'Contratista2026*');
+        if (existing) {
+          const mergedContratoNro = existing.contratoNro || c.contratoNro;
+          map.set(key, {
+            ...existing,
+            ...c,
+            contratoNro: mergedContratoNro,
+            password: resolvedPass,
+            isSyncedToDb: existing.isSyncedToDb ?? isUuid(existing.id)
+          });
+        } else {
+          map.set(key, { ...c, password: resolvedPass, isSyncedToDb: isUuid(c.id) });
+        }
+      }
+    });
+
+    let allContractors = Array.from(map.values());
+
+    // Filtrar por secretaría si se proporcionó parámetro
+    if (secretariaId) {
+      allContractors = allContractors.filter(c => {
+        if (c.secretariaId === secretariaId) return true;
+        if (isUuid(secretariaId) && isUuid(c.secretariaId) && c.secretariaId === secretariaId) return true;
+        if (secretariaId.includes('170') && c.secretariaCodigo === '170') return true;
+        return false;
+      });
+    }
+
+    return allContractors;
+  },
+
+  // 5. Crear Contratista o Supervisor en Supabase (Tabla 'profiles')
+  async createContractor(
+    contractorData: Omit<AuthUser, 'id'> | (Omit<AuthUser, 'id' | 'role'> & { role?: UserRole })
+  ): Promise<{ success: boolean; data: AuthUser; error?: string }> {
+    const rawEmail = contractorData.email.trim();
+    const rawDoc = contractorData.documentoIdentidad.trim().replace(/\./g, '');
+    const userRole: UserRole = (contractorData as any).role || 'contratista';
+    const pass = contractorData.password?.trim() || (userRole === 'secretaria_admin' || userRole === 'secretaria_supervisor' ? 'Supervisor2026*' : 'Contratista2026*');
+    const fullName = contractorData.nombreCompleto.trim().toUpperCase();
+    const phone = contractorData.telefono?.trim() || '';
+    const cargo = contractorData.cargo?.trim() || (userRole === 'secretaria_admin' || userRole === 'secretaria_supervisor' ? 'Supervisor / Apoyo a la Supervisión' : 'Contratista de Prestación de Servicios');
+
+    // Resolver UUID real de la secretaría
+    const secUuid = await this.resolveSecretariaUuid(contractorData.secretariaId || contractorData.secretariaCodigo || contractorData.secretariaNombre);
+
+    // 1. Verificar si ya existe un perfil en Supabase 'profiles' (por documento o email)
+    let existingProfile: any = null;
+    try {
+      const { data: profData } = await supabase
+        .from('profiles')
+        .select('*')
+        .or(`documento_identidad.eq.${rawDoc},email.ilike.${rawEmail}`)
+        .limit(1);
+      if (profData && profData.length > 0) {
+        existingProfile = profData[0];
+      }
+    } catch (e) {
+      console.warn('Notice checking existing profile:', e);
+    }
+
+    let createdId: string = `usr-${userRole}-${Date.now()}`;
+    let dbErrorMsg: string | undefined;
+
+    if (existingProfile) {
+      // SI YA EXISTE EN PROFILES: Actualizar directamente sin llamar auth.signUp (evita 429)
+      createdId = existingProfile.id;
+      try {
+        const updatePayload: any = {
+          role: userRole,
+          nombre_completo: fullName,
+          password: pass,
+          telefono: phone,
+          direccion: contractorData.direccion || contractorData.barrio || '',
+          cargo: cargo,
+          activo: true,
+        };
+        if (secUuid && isUuid(secUuid)) {
+          updatePayload.secretaria_id = secUuid;
+        }
+        await executeProfileUpdate(updatePayload, existingProfile.id);
+      } catch (e: any) {
+        console.warn('Notice updating existing contractor profile:', e);
+      }
+    } else {
+      // SI NO EXISTE EN PROFILES: Insertamos directamente sin pasar por auth.users
+      // IMPORTANTE: Esto requiere haber eliminado la FK en la base de datos de Supabase.
+      const finalUserId = crypto.randomUUID();
+      createdId = finalUserId;
+      
+      const profilePayload: any = {
+        id: finalUserId,
+        role: userRole,
+        nombre_completo: fullName,
+        documento_identidad: rawDoc,
+        email: rawEmail,
+        password: pass,
+        telefono: phone,
+        direccion: contractorData.direccion || contractorData.barrio || '',
+        cargo: cargo,
+        activo: true,
+      };
+      
+      if (secUuid && isUuid(secUuid)) {
+        profilePayload.secretaria_id = secUuid;
+      }
+
+      try {
+        const { data: inserted, error: insertErr } = await executeProfileInsert(profilePayload);
+
+        if (inserted?.id) {
+          createdId = inserted.id;
+        } else if (insertErr) {
+          console.warn('Profiles insert notice (might be missing FK in auth.users):', insertErr.message);
+        }
+      } catch (e: any) {
+        console.warn('Profiles catch notice:', e);
+      }
+    }
+
+    // 2. Crear o actualizar contrato vinculado en la tabla 'contratos' de Supabase (SOLO si se proporcionaron datos de contrato)
+    if (contractorData.contratoNro || contractorData.valorContrato || contractorData.objetoContrato) {
+      try {
+        const cleanNumeric = (val?: string | number): number | null => {
+          if (typeof val === 'number') return val;
+          if (!val) return null;
+          const cleaned = val.toString().replace(/[^0-9]/g, '');
+          const parsed = parseInt(cleaned, 10);
+          return isNaN(parsed) ? null : parsed;
+        };
+
+        const parseDateForPg = (dateStr?: string): string | null => {
+          if (!dateStr || dateStr === 'N/A') return null;
+          if (dateStr.includes('/')) {
+            const parts = dateStr.split('/');
+            if (parts.length === 3) {
+              return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+            }
+          }
+          if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+          return null;
+        };
+
+        const validContratistaId = (createdId && isUuid(createdId)) ? createdId : null;
+        const secId = await this.resolveSecretariaUuid(contractorData.secretariaId, contractorData.secretariaNombre);
+        const contratoNro = contractorData.contratoNro ? contractorData.contratoNro.trim() : null;
+
+        // Buscar si ya existe contrato registrado
+        let existingContrato: any = null;
+        try {
+          if (validContratistaId) {
+            const { data: cData } = await supabase
+              .from('contratos')
+              .select('id, contrato_nro')
+              .eq('contratista_id', validContratistaId)
+              .limit(1);
+            if (cData && cData.length > 0) {
+              existingContrato = cData[0];
+            }
+          }
+          if (!existingContrato && contratoNro) {
+            const { data: cDataNro } = await supabase
+              .from('contratos')
+              .select('id, contrato_nro')
+              .eq('contrato_nro', contratoNro)
+              .limit(1);
+            if (cDataNro && cDataNro.length > 0) {
+              existingContrato = cDataNro[0];
+            }
+          }
+        } catch (cCheckErr) {
+          console.warn('Notice checking existing contrato:', cCheckErr);
+        }
+
+        const isValNro = (n?: any) => n && String(n).trim() !== '' && !/^20\d{2}$/.test(String(n));
+        const finalPayloadContratoNro = (isValNro(contratoNro))
+          ? contratoNro
+          : (existingContrato?.contrato_nro && isValNro(existingContrato.contrato_nro) ? existingContrato.contrato_nro : '');
+
+        const contratoPayload: any = {
+          contratista_id: validContratistaId,
+          secretaria_id: secId,
+          contrato_nro: finalPayloadContratoNro,
+          objeto: contractorData.objetoContrato || '',
+          valor_contrato: cleanNumeric(contractorData.valorContrato),
+          cdp_nro: contractorData.cdpNro || '137',
+          crp_nro: contractorData.crpNro || '191',
+          poliza_nro: contractorData.polizaNro && contractorData.polizaNro !== 'N/A' ? contractorData.polizaNro : null,
+          fecha_aprobacion_poliza: parseDateForPg((contractorData as any).fechaPoliza),
+          plazo_meses: (contractorData as any).plazoMeses ? Number((contractorData as any).plazoMeses) : 6,
+          fecha_inicio: parseDateForPg(contractorData.fechaInicio) || '2026-01-15',
+          fecha_terminacion: parseDateForPg(contractorData.fechaTerminacion) || '2026-07-14',
+          supervisor_nombre: contractorData.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA',
+          supervisor_documento: contractorData.supervisorDocumento || '35602521',
+          apoyo_supervision_nombre: contractorData.apoyoSupervisionNombre && contractorData.apoyoSupervisionNombre !== 'N/A' ? contractorData.apoyoSupervisionNombre : null,
+          apoyo_supervision_documento: contractorData.apoyoSupervisionDocumento && contractorData.apoyoSupervisionDocumento !== 'N/A' ? contractorData.apoyoSupervisionDocumento : null,
+          numero_cuenta: contractorData.numeroCuenta || '',
+          banco: contractorData.banco || '',
+          tipo_cuenta: contractorData.tipoCuenta || 'AHORRO',
+          ciudad: contractorData.ciudad || '',
+          vigencia: 2026,
+        };
+
+        if (existingContrato) {
+          await supabase
+            .from('contratos')
+            .update(contratoPayload)
+            .eq('id', existingContrato.id);
+        } else {
+          const { error: cErr } = await supabase
+            .from('contratos')
+            .insert([contratoPayload]);
+          if (cErr) {
+            console.warn('Contrato insert warning:', cErr.message);
+          }
+        }
+      } catch (e) {
+        console.warn('Notice creating initial contract:', e);
+      }
+    }
+
+    // 3. Guardar credenciales para inicio de sesión si se definió contraseña
+    if (pass) {
+      this.saveUserPassword(rawEmail, pass);
+      this.saveUserPassword(rawDoc, pass);
+    }
+
+    const newContractor: AuthUser = {
+      ...contractorData,
+      id: createdId,
+      role: userRole,
+      password: pass,
+      nombreCompleto: fullName,
+      email: rawEmail,
+      documentoIdentidad: rawDoc,
+      telefono: phone,
+      cargo: cargo,
+      secretariaId: secUuid || contractorData.secretariaId,
+      createdAt: new Date().toISOString(),
+    };
+
+    newContractor.isSyncedToDb = isUuid(createdId);
+
+    // 4. Persistir en localStorage como respaldo
+    const storedUsers = localStorage.getItem(STORAGE_USERS_KEY);
+    const customUsers: AuthUser[] = storedUsers ? JSON.parse(storedUsers) : [];
+    const filtered = customUsers.filter(u => u.documentoIdentidad !== rawDoc && u.email.toLowerCase() !== rawEmail.toLowerCase());
+    filtered.push(newContractor);
+    localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(filtered));
+
+    return { success: true, data: newContractor, error: dbErrorMsg };
+  },
+
+  // 5b. Sincronizar manualmente un Contratista con Supabase (Auth + Profiles + Contratos)
+  async syncContractorToSupabase(
+    contractor: AuthUser
+  ): Promise<{ success: boolean; message: string; updatedUser?: AuthUser }> {
+    const rawEmail = contractor.email.trim();
+    const rawDoc = contractor.documentoIdentidad.trim().replace(/\./g, '');
+    const pass = contractor.password?.trim() || this.getUserPassword(rawEmail) || this.getUserPassword(rawDoc) || 'Contratista2026*';
+    const fullName = contractor.nombreCompleto.trim().toUpperCase();
+    const phone = contractor.telefono?.trim() || '';
+    const cargo = contractor.cargo?.trim() || 'Contratista de Prestación de Servicios';
+
+    const secUuid = await this.resolveSecretariaUuid(contractor.secretariaId || contractor.secretariaCodigo || contractor.secretariaNombre);
+
+    // 1. Verificar si ya existe en profiles por documento o email
+    let existingProfile: any = null;
+    try {
+      const { data: profData } = await supabase
+        .from('profiles')
+        .select('*')
+        .or(`documento_identidad.eq.${rawDoc},email.ilike.${rawEmail}`)
+        .limit(1);
+      if (profData && profData.length > 0) {
+        existingProfile = profData[0];
+      }
+    } catch (e) {
+      console.warn('Notice checking existing profile:', e);
+    }
+
+    let authUserId: string | null = existingProfile?.id || null;
+
+    // 2. Si no existe en profiles, insertamos directamente
+    const finalUserId = (authUserId && isUuid(authUserId)) ? authUserId : contractor.id || crypto.randomUUID();
+    
+    // 3. Insertar o actualizar en la tabla profiles
+    const profilePayload: any = {
+      id: finalUserId,
+      role: 'contratista',
+      nombre_completo: fullName,
+      documento_identidad: rawDoc,
+      email: rawEmail,
+      telefono: phone,
+      direccion: contractor.direccion || contractor.barrio || '',
+      cargo: cargo,
+      activo: true,
+    };
+    if (secUuid && isUuid(secUuid)) {
+      profilePayload.secretaria_id = secUuid;
+    }
+
+    try {
+      const { error: upsertErr } = await supabase
+        .from('profiles')
+        .upsert([profilePayload], { onConflict: 'id' });
+      if (upsertErr) {
+        console.warn('Profiles upsert notice during sync (might be missing FK in auth.users):', upsertErr.message);
+      }
+    } catch (e: any) {
+      console.warn('Profiles catch during sync:', e);
+    }
+
+    // 4. Actualizar el contratista_id en la tabla contratos
+    try {
+      if (contractor.id && isUuid(contractor.id)) {
+        if (contractor.contratoNro) {
+          await supabase.from('contratos').update({ contratista_id: finalUserId }).or(`contratista_id.eq.${contractor.id},contrato_nro.eq.${contractor.contratoNro}`);
+        } else {
+          await supabase.from('contratos').update({ contratista_id: finalUserId }).eq('contratista_id', contractor.id);
+        }
+      } else if (contractor.contratoNro) {
+        await supabase.from('contratos').update({ contratista_id: finalUserId }).eq('contrato_nro', contractor.contratoNro);
+      }
+    } catch (e) {
+      console.warn('Contratos update notice during sync:', e);
+    }
+
+    // 5. Actualizar en localStorage
+    const updatedContractor: AuthUser = {
+      ...contractor,
+      id: finalUserId,
+      isSyncedToDb: true,
+    };
+
+    try {
+      const storedUsers = localStorage.getItem(STORAGE_USERS_KEY);
+      if (storedUsers) {
+        const customUsers: AuthUser[] = JSON.parse(storedUsers);
+        const updatedList = customUsers.map(u => {
+          if (u.documentoIdentidad === rawDoc || u.email.toLowerCase() === rawEmail.toLowerCase() || u.id === contractor.id) {
+            return updatedContractor;
+          }
+          return u;
+        });
+        localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(updatedList));
+      }
+    } catch (e) {}
+
+    this.saveUserPassword(rawEmail, pass);
+    this.saveUserPassword(rawDoc, pass);
+
+    return {
+      success: true,
+      message: `¡Contratista ${fullName} sincronizado exitosamente con la base de datos de Supabase!`,
+      updatedUser: updatedContractor,
+    };
+  },
+
+  // 6. Actualizar / Editar Contratista en Supabase
+  async updateContractor(
+    contractorId: string,
+    updateData: Partial<AuthUser>
+  ): Promise<{ success: boolean; data?: AuthUser; error?: string }> {
+    const rawEmail = updateData.email?.trim();
+    const rawDoc = updateData.documentoIdentidad?.trim().replace(/\./g, '');
+    const fullName = updateData.nombreCompleto?.trim().toUpperCase();
+    const phone = updateData.telefono?.trim();
+    const cargo = updateData.cargo?.trim();
+    const pass = updateData.password?.trim();
+
+    try {
+      const profileUpdatePayload: any = {};
+      if (fullName) profileUpdatePayload.nombre_completo = fullName;
+      if (rawDoc) profileUpdatePayload.documento_identidad = rawDoc;
+      if (rawEmail) profileUpdatePayload.email = rawEmail;
+      if (phone !== undefined) profileUpdatePayload.telefono = phone;
+      if (updateData.role) profileUpdatePayload.role = updateData.role;
+      if (updateData.direccion !== undefined || updateData.barrio !== undefined) {
+        profileUpdatePayload.direccion = updateData.direccion || updateData.barrio || '';
+      }
+      if (cargo !== undefined) profileUpdatePayload.cargo = cargo;
+      if (pass) profileUpdatePayload.password = pass;
+
+      let targetProfileId: string | null = isUuid(contractorId) ? contractorId : null;
+      if (!targetProfileId) {
+        try {
+          const { data: prof } = await supabase
+            .from('profiles')
+            .select('id')
+            .or(`documento_identidad.eq.${rawDoc || contractorId},email.ilike.${rawEmail || contractorId}`)
+            .limit(1)
+            .maybeSingle();
+          if (prof?.id) targetProfileId = prof.id;
+        } catch (e) {}
+      }
+
+      if (targetProfileId) {
+        await executeProfileUpdate(profileUpdatePayload, targetProfileId);
+      } else if (rawDoc) {
+        try {
+          const { error: errUpd } = await supabase
+            .from('profiles')
+            .update(profileUpdatePayload)
+            .eq('documento_identidad', rawDoc);
+          if (errUpd && errUpd.code === 'PGRST204') {
+            const stripped = { ...profileUpdatePayload };
+            delete stripped.password;
+            delete stripped.updated_at;
+            await supabase.from('profiles').update(stripped).eq('documento_identidad', rawDoc);
+          }
+        } catch (e) {}
+      }
+
+      // Sincronizar tabla contratos si se editaron campos contractuales
+      const contractUpdatePayload: any = {};
+      const parseDateForPg = (dateStr?: string, defaultDate: string = '2026-01-15'): string | null => {
+        if (!dateStr || dateStr === 'N/A') return null;
+        if (dateStr.includes('/')) {
+          const parts = dateStr.split('/');
+          if (parts.length === 3) {
+            const yr = parts[2].length === 2 ? `20${parts[2]}` : parts[2];
+            return `${yr}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+          }
+        }
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+        return defaultDate;
+      };
+
+      if (updateData.fechaInicio) contractUpdatePayload.fecha_inicio = parseDateForPg(updateData.fechaInicio);
+      if (updateData.fechaTerminacion) contractUpdatePayload.fecha_terminacion = parseDateForPg(updateData.fechaTerminacion);
+      if (updateData.contratoNro) contractUpdatePayload.contrato_nro = updateData.contratoNro;
+      if (updateData.objetoContrato) contractUpdatePayload.objeto = updateData.objetoContrato;
+      if (updateData.cdpNro) contractUpdatePayload.cdp_nro = updateData.cdpNro;
+      if (updateData.crpNro) contractUpdatePayload.crp_nro = updateData.crpNro;
+      if (updateData.polizaNro) contractUpdatePayload.poliza_nro = updateData.polizaNro === 'N/A' ? null : updateData.polizaNro;
+      if (updateData.supervisorNombre) contractUpdatePayload.supervisor_nombre = updateData.supervisorNombre;
+      if (updateData.supervisorDocumento) contractUpdatePayload.supervisor_documento = updateData.supervisorDocumento;
+      if (updateData.apoyoSupervisionNombre) contractUpdatePayload.apoyo_supervision_nombre = updateData.apoyoSupervisionNombre === 'N/A' ? null : updateData.apoyoSupervisionNombre;
+      if (updateData.apoyoSupervisionDocumento) contractUpdatePayload.apoyo_supervision_documento = updateData.apoyoSupervisionDocumento === 'N/A' ? null : updateData.apoyoSupervisionDocumento;
+      if (updateData.numeroCuenta) contractUpdatePayload.numero_cuenta = updateData.numeroCuenta;
+      if (updateData.banco) contractUpdatePayload.banco = updateData.banco;
+      if (updateData.tipoCuenta) contractUpdatePayload.tipo_cuenta = updateData.tipoCuenta;
+      if (updateData.ciudad) contractUpdatePayload.ciudad = updateData.ciudad;
+
+      if (Object.keys(contractUpdatePayload).length > 0) {
+        if (targetProfileId) {
+          await supabase.from('contratos').update(contractUpdatePayload).eq('contratista_id', targetProfileId);
+        } else if (rawDoc) {
+          const { data: prof } = await supabase.from('profiles').select('id').eq('documento_identidad', rawDoc).limit(1).maybeSingle();
+          if (prof?.id) {
+            await supabase.from('contratos').update(contractUpdatePayload).eq('contratista_id', prof.id);
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn('Error updating contractor in Supabase:', e);
+    }
+
+    // Determinar email y documento del usuario para guardar contraseña de forma robusta
+    let finalEmail = rawEmail;
+    let finalDoc = rawDoc;
+    if (!finalEmail || !finalDoc) {
+      try {
+        const stored = localStorage.getItem(STORAGE_USERS_KEY);
+        if (stored) {
+          const list: AuthUser[] = JSON.parse(stored);
+          const match = list.find(u => u.id === contractorId || (rawDoc && u.documentoIdentidad === rawDoc));
+          if (match) {
+            finalEmail = finalEmail || match.email;
+            finalDoc = finalDoc || match.documentoIdentidad;
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (pass) {
+      if (finalEmail) this.saveUserPassword(finalEmail, pass);
+      if (finalDoc) this.saveUserPassword(finalDoc, pass);
+      if (rawEmail && rawEmail !== finalEmail) this.saveUserPassword(rawEmail, pass);
+      if (rawDoc && rawDoc !== finalDoc) this.saveUserPassword(rawDoc, pass);
+      if (contractorId) this.saveUserPassword(contractorId, pass);
+    }
+
+    // Actualizar localStorage
+    const storedUsers = localStorage.getItem(STORAGE_USERS_KEY);
+    const customUsers: AuthUser[] = storedUsers ? JSON.parse(storedUsers) : [];
+    let updatedUser: AuthUser | undefined;
+
+    const newUsers = customUsers.map(u => {
+      if (u.id === contractorId || (rawDoc && u.documentoIdentidad === rawDoc) || (finalDoc && u.documentoIdentidad === finalDoc) || (finalEmail && u.email?.toLowerCase() === finalEmail.toLowerCase())) {
+        const resolvedPass = pass || u.password || (finalEmail ? this.getUserPassword(finalEmail) : undefined) || (finalDoc ? this.getUserPassword(finalDoc) : undefined) || 'Contratista2026*';
+        updatedUser = {
+          ...u,
+          ...updateData,
+          nombreCompleto: fullName || u.nombreCompleto,
+          documentoIdentidad: rawDoc || u.documentoIdentidad,
+          email: rawEmail || u.email,
+          telefono: phone !== undefined ? phone : u.telefono,
+          cargo: cargo !== undefined ? cargo : u.cargo,
+          direccion: updateData.direccion !== undefined ? updateData.direccion : (u.direccion || u.barrio || ''),
+          barrio: updateData.direccion !== undefined ? updateData.direccion : (u.barrio || u.direccion || ''),
+          password: resolvedPass,
+        };
+        return updatedUser;
+      }
+      return u;
+    });
+
+    if (!updatedUser) {
+      const resolvedPass = pass || (finalEmail ? this.getUserPassword(finalEmail) : undefined) || (finalDoc ? this.getUserPassword(finalDoc) : undefined) || 'Contratista2026*';
+      updatedUser = {
+        id: contractorId,
+        email: rawEmail || finalEmail || '',
+        nombreCompleto: fullName || '',
+        documentoIdentidad: rawDoc || finalDoc || '',
+        role: updateData.role || 'contratista',
+        telefono: phone,
+        cargo: cargo,
+        direccion: updateData.direccion || updateData.barrio || '',
+        barrio: updateData.barrio || updateData.direccion || '',
+        password: resolvedPass,
+        ...updateData,
+      };
+      newUsers.push(updatedUser);
+    }
+
+    localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(newUsers));
+
+    return { success: true, data: updatedUser };
+  },
+
+  // 7. Eliminar / Desvincular Contratista en Supabase
+  async deleteContractor(contractorId: string): Promise<boolean> {
+    try {
+      if (isUuid(contractorId)) {
+        await supabase.from('profiles').delete().eq('id', contractorId);
+      } else {
+        await supabase.from('profiles').delete().eq('documento_identidad', contractorId);
+      }
+    } catch (e) {
+      console.warn('Error deleting contractor from Supabase:', e);
+    }
+
+    const storedUsers = localStorage.getItem(STORAGE_USERS_KEY);
+    const customUsers: AuthUser[] = storedUsers ? JSON.parse(storedUsers) : [];
+    const filtered = customUsers.filter(u => u.id !== contractorId && u.documentoIdentidad !== contractorId);
+    localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(filtered));
+    return true;
+  },
+
+  // 7. Obtener Todos los Usuarios Registrados (Super Admin / Login)
+  async getAllUsers(): Promise<AuthUser[]> {
+    let usersFromDb: AuthUser[] = [];
+    try {
+      let { data, error } = await supabase
+        .from('profiles')
+        .select('*, sec_secretarias(*)')
+        .order('created_at', { ascending: false });
+
+      if (error || !data || data.length === 0) {
+        const fallback = await supabase.from('profiles').select('*');
+        if (!fallback.error && fallback.data) {
+          data = fallback.data;
+          error = null;
+        }
+      }
+
+      if (!error && data && data.length > 0) {
+        usersFromDb = data.map((row: any) => {
+          const doc = row.documento_identidad || '';
+          const mail = row.email || '';
+          const role = (row.role as any) || 'contratista';
+          const defaultRolePass = role === 'super_admin' ? 'Quibdo2026*' : (role === 'secretaria_admin' || role === 'secretaria_supervisor') ? 'Supervisor2026*' : 'Contratista2026*';
+          const pass = row.password || this.getUserPassword(mail) || this.getUserPassword(doc) || this.getUserPassword(row.id) || defaultRolePass;
+          if (row.password) {
+            this.saveUserPassword(mail, row.password);
+            this.saveUserPassword(doc, row.password);
+            if (row.id) this.saveUserPassword(row.id, row.password);
+          }
+
+          return {
+            id: row.id,
+            email: mail,
+            password: pass,
+            nombreCompleto: row.nombre_completo || 'USUARIO DEL SISTEMA',
+            documentoIdentidad: doc,
+            role: role,
+            secretariaId: row.secretaria_id || '',
+            secretariaNombre: row.sec_secretarias?.nombre || '',
+            secretariaCodigo: row.sec_secretarias?.codigo || '',
+            cargo: row.cargo || '',
+            telefono: row.telefono || '',
+            barrio: row.direccion || row.barrio || '',
+            direccion: row.direccion || row.barrio || '',
+            createdAt: row.created_at || new Date().toISOString(),
+          };
+        });
+      }
+    } catch (err) {
+      console.warn('Error fetching all users from Supabase:', err);
+    }
+
+    // SIEMPRE combinar usuarios de DB con SYSTEM_CORE_USERS y localStorage
+    const map = new Map<string, AuthUser>();
+    SYSTEM_CORE_USERS.forEach(u => {
+      const key = (u.email ? u.email.toLowerCase() : u.documentoIdentidad).replace(/\./g, '').trim();
+      if (key) map.set(key, u);
+    });
+
+    usersFromDb.forEach(u => {
+      const key = (u.email ? u.email.toLowerCase() : u.documentoIdentidad).replace(/\./g, '').trim();
+      if (key) map.set(key, u);
+    });
+
+    const stored = localStorage.getItem(STORAGE_USERS_KEY);
+    const customUsers: AuthUser[] = stored ? JSON.parse(stored) : [];
+    customUsers.forEach(u => {
+      const key = (u.email ? u.email.toLowerCase() : u.documentoIdentidad).replace(/\./g, '').trim();
+      if (key) {
+        const existing = map.get(key);
+        map.set(key, existing ? { ...existing, ...u } : u);
+      }
+    });
+
+    return Array.from(map.values());
+  },
+
+  // Helper: Obtener Perfil de Usuario Completo por ID, Documento o Email
+  async getUserProfile(identifier: string): Promise<AuthUser | null> {
+    if (!identifier) return null;
+    const cleanId = identifier.trim().replace(/\./g, '');
+    try {
+      const orConditions: string[] = [];
+      if (isUuid(cleanId)) {
+        orConditions.push(`id.eq.${cleanId}`);
+      }
+      orConditions.push(`documento_identidad.eq.${cleanId}`);
+      if (identifier !== cleanId) {
+        orConditions.push(`documento_identidad.eq.${identifier}`);
+      }
+      orConditions.push(`email.ilike.${cleanId}`);
+
+      let { data } = await supabase
+        .from('profiles')
+        .select('*, sec_secretarias(*), contratos(*)')
+        .or(orConditions.join(','))
+        .limit(1);
+
+      if (data && data.length > 0) {
+        const row = data[0];
+        const isValContNro = (n?: any) => n && String(n).trim() !== '' && !/^20\d{2}$/.test(String(n));
+
+        const contList = Array.isArray(row.contratos) ? row.contratos : (row.contratos ? [row.contratos] : []);
+        let cont = contList.find((c: any) => c && isValContNro(c.contrato_nro)) || contList[0];
+        let dirVal = row.direccion || row.barrio || '';
+        const doc = row.documento_identidad || '';
+        const mail = row.email || '';
+
+        // Buscar siempre en la tabla 'contratos' por contratista_id para obtener el contrato real (ej. '015').
+        // contratista_id es uuid: incluir el documento en el filtro provoca 400 (22P02) y anula la consulta.
+        try {
+          const { data: cRows, error: cErr } = await supabase
+            .from('contratos')
+            .select('*')
+            .eq('contratista_id', row.id)
+            .order('created_at', { ascending: false })
+            .limit(5);
+
+          if (cErr) console.warn('Error consultando contratos del perfil:', cErr.message);
+
+          if (cRows && cRows.length > 0) {
+            const bestC = cRows.find((c: any) => c && isValContNro(c.contrato_nro)) || cRows[0];
+            if (bestC) {
+              cont = { ...cont, ...bestC };
+            }
+          }
+        } catch (ce) {}
+
+        let extraContratoNro = (cont?.contrato_nro && isValContNro(cont.contrato_nro)) ? cont.contrato_nro : '';
+        if (!extraContratoNro && (doc || row.id)) {
+          try {
+            const cleanDoc = doc.replace(/\D/g, '');
+            const { data: infList } = await supabase
+              .from('informes_mensuales')
+              .select('*')
+              .limit(25);
+
+            if (infList && infList.length > 0) {
+              for (const inf of infList) {
+                const p = inf.payload;
+                const cNro = inf.contrato_nro || (inf as any).contratos?.contrato_nro || p?.contratoNro;
+                if (cNro && isValContNro(cNro)) {
+                  const infDoc = (p?.contratistaDocumento || '').replace(/\D/g, '');
+                  if ((cleanDoc && infDoc === cleanDoc) || p?.contratistaDocumento === doc || p?.contratistaDocumento === row.id) {
+                    extraContratoNro = cNro;
+                    break;
+                  }
+                }
+              }
+            }
+          } catch (ie) {}
+        }
+
+        // Fallback: Si no tiene dirección o datos bancarios en perfil/contrato, intentar buscar en sus informes
+        let valMensual = '';
+        let bancoFromReport = '';
+        let numCuentaFromReport = '';
+        let tipoCuentaFromReport = '';
+        let ciudadFromReport = '';
+        let dirFromReport = '';
+        let fechaRegistroFromReport = '';
+        let codigoRubroFromReport = '';
+
+        if (cont?.id) {
+          try {
+            const { data: latestReport } = await supabase
+              .from('informes_mensuales')
+              .select('*')
+              .eq('contrato_id', cont.id)
+              .order('informe_nro', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            if (latestReport?.observaciones) {
+              const { 
+                valorMensualText, 
+                bancoText, 
+                numeroCuentaText, 
+                tipoCuentaText, 
+                ciudadText, 
+                fechaRegistroPresupuestalText, 
+                codigoRubroText 
+              } = parseObservacionesAndComments(latestReport.observaciones);
+              if (valorMensualText) valMensual = valorMensualText;
+              if (bancoText) bancoFromReport = bancoText;
+              if (numeroCuentaText) numCuentaFromReport = numeroCuentaText;
+              if (tipoCuentaText) tipoCuentaFromReport = tipoCuentaText;
+              if (ciudadText) ciudadFromReport = ciudadText;
+              if (fechaRegistroPresupuestalText) fechaRegistroFromReport = fechaRegistroPresupuestalText;
+              if (codigoRubroText) codigoRubroFromReport = codigoRubroText;
+            }
+            if (latestReport?.payload) {
+              const p = latestReport.payload;
+              if (p.banco && !bancoFromReport) bancoFromReport = p.banco;
+              if (p.numeroCuenta && !numCuentaFromReport) numCuentaFromReport = p.numeroCuenta;
+              if (p.tipoCuenta && !tipoCuentaFromReport) tipoCuentaFromReport = p.tipoCuenta;
+              if (p.ciudad && !ciudadFromReport) ciudadFromReport = p.ciudad;
+              if ((p.direccion || p.barrio || p.contratistaDireccion) && !dirFromReport) {
+                dirFromReport = p.direccion || p.barrio || p.contratistaDireccion;
+              }
+            }
+          } catch (e) {
+            console.warn('Error fetching latest report inside getUserProfile:', e);
+          }
+        }
+
+        if (!dirVal && dirFromReport) {
+          dirVal = dirFromReport;
+        }
+
+        if (!dirVal && row.documento_identidad) {
+          try {
+            const { data: infData } = await supabase
+              .from('informes_mensuales')
+              .select('*')
+              .limit(10);
+            if (infData) {
+              for (const item of infData) {
+                const p = item.payload;
+                if (p && (p.contratistaDocumento === row.documento_identidad || p.contratistaDocumento === cleanId)) {
+                  if (p.direccion || p.barrio || p.contratistaDireccion) {
+                    dirVal = p.direccion || p.barrio || p.contratistaDireccion;
+                    break;
+                  }
+                }
+              }
+            }
+          } catch (e) {}
+        }
+
+        const userRole = row.role || 'contratista';
+        const defaultRolePass = (userRole === 'secretaria_admin' || userRole === 'secretaria_supervisor') ? 'Supervisor2026*' : 'Contratista2026*';
+        const pass = row.password || this.getUserPassword(mail) || this.getUserPassword(doc) || this.getUserPassword(row.id) || defaultRolePass;
+
+        const finalContratoNro = (cont?.contrato_nro && isValContNro(cont.contrato_nro))
+          ? cont.contrato_nro
+          : (isValContNro(extraContratoNro) ? extraContratoNro : (cont?.contrato_nro || ''));
+
+        return {
+          id: row.id,
+          email: mail,
+          password: pass,
+          nombreCompleto: row.nombre_completo || '',
+          documentoIdentidad: doc,
+          role: userRole,
+          secretariaId: row.secretaria_id || '',
+          secretariaNombre: row.sec_secretarias?.nombre || '',
+          secretariaCodigo: row.sec_secretarias?.codigo || '',
+          cargo: row.cargo || '',
+          telefono: row.telefono || '',
+          barrio: dirVal,
+          direccion: dirVal,
+          contratoNro: finalContratoNro,
+          objetoContrato: cont?.objeto || '',
+          valorContrato: cont?.valor_contrato ? formatColombianCurrency(cont.valor_contrato) : '',
+          valorMensual: valMensual || '',
+          cdpNro: cont?.cdp_nro || '',
+          crpNro: cont?.crp_nro || '',
+          polizaNro: cont?.poliza_nro || '',
+          fechaPoliza: cont?.fecha_aprobacion_poliza ? formatDateSlash(cont.fecha_aprobacion_poliza) : '',
+          plazo: cont?.plazo_meses ? `${cont.plazo_meses} meses` : '',
+          fechaInicio: cont?.fecha_inicio ? formatDateSlash(cont.fecha_inicio) : '',
+          fechaTerminacion: cont?.fecha_terminacion ? formatDateSlash(cont.fecha_terminacion) : '',
+          numeroCuenta: cont?.numero_cuenta || numCuentaFromReport || '',
+          banco: cont?.banco || bancoFromReport || '',
+          tipoCuenta: cont?.tipo_cuenta || tipoCuentaFromReport || '',
+          ciudad: cont?.ciudad || ciudadFromReport || '',
+          ciudadCuenta: cont?.ciudad || ciudadFromReport || '',
+          fechaRegistroPresupuestal: fechaRegistroFromReport || '',
+          codigoRubro: codigoRubroFromReport || '',
+          supervisorNombre: cont?.supervisor_nombre || '',
+          supervisorDocumento: cont?.supervisor_documento || '',
+        };
+      }
+    } catch (err) {
+      console.warn('Error fetching user profile:', err);
+    }
+    return null;
+  },
+
+  // Helper: Asegurar existencia de Contrato en la BD vinculando el contratista y secretaría
+  async ensureContrato(report: ReportData, user?: AuthUser): Promise<string | null> {
+    try {
+      const doc = report.contratistaDocumento || user?.documentoIdentidad;
+      let contratistaId = user?.id;
+
+      // 1. Buscar perfil de contratista por ID o documento
+      if (!contratistaId || !isUuid(contratistaId)) {
+        if (doc) {
+          const { data: prof } = await supabase
+            .from('profiles')
+            .select('id, secretaria_id')
+            .eq('documento_identidad', doc)
+            .maybeSingle();
+          if (prof?.id) {
+            contratistaId = prof.id;
+          }
+        }
+      }
+
+      // Si no existe perfil en profiles, crearlo
+      if (!contratistaId || !isUuid(contratistaId)) {
+        const secId = await this.resolveSecretariaId(report.secretariaId || user?.secretariaId, report.secretariaNombre);
+        const { data: newProf, error: errProf } = await executeProfileInsert({
+          id: crypto.randomUUID(),
+          email: report.contratistaCorreo || user?.email || `contratista_${doc ? doc.replace(/\D/g, '') : Date.now()}@quibdo-choco.gov.co`,
+          role: 'contratista',
+          nombre_completo: (report.contratistaNombre || user?.nombreCompleto || 'CONTRATISTA REGISTRADO').toUpperCase(),
+          documento_identidad: doc || `CC-${Date.now()}`,
+          telefono: report.contratistaTelefono || user?.telefono || '3100000000',
+          secretaria_id: secId,
+          cargo: user?.cargo || 'Contratista de Prestación de Servicios',
+        });
+
+        if (!errProf && newProf?.id) {
+          contratistaId = newProf.id;
+        } else if (errProf) {
+          console.warn('Error inserting profile in ensureContrato:', errProf);
+        }
+      }
+
+      const validContratistaId = (contratistaId && isUuid(contratistaId)) ? contratistaId : null;
+      const contratoNro = extractContratoNroOnly(report.contratoNro) || extractContratoNroOnly(user?.contratoNro) || '590';
+
+      // 2. Normalizar valor numérico y fechas para PostgreSQL
+      const cleanNumeric = (val?: string | number): number => {
+        if (typeof val === 'number') return val;
+        if (!val) return 20029800;
+        const cleaned = val.toString().replace(/[^0-9]/g, '');
+        return parseInt(cleaned, 10) || 20029800;
+      };
+
+      const parseDateForPg = (dateStr?: string, defaultDate: string = '2026-01-15'): string | null => {
+        if (!dateStr || dateStr === 'N/A') return null;
+        if (dateStr.includes('/')) {
+          const parts = dateStr.split('/');
+          if (parts.length === 3) {
+            const yr = parts[2].length === 2 ? `20${parts[2]}` : parts[2];
+            return `${yr}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+          }
+        }
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+        return defaultDate;
+      };
+
+      const parsePlazoToMeses = (plazoStr?: string): number => {
+        if (!plazoStr) return 6;
+        const match = plazoStr.match(/(\d+)/);
+        return match ? parseInt(match[1], 10) : 6;
+      };
+
+      const secId = await this.resolveSecretariaUuid(report.secretariaId || user?.secretariaId, report.secretariaNombre);
+      
+      const contractPayload: any = {
+        contratista_id: validContratistaId,
+        secretaria_id: secId,
+        contrato_nro: contratoNro,
+        objeto: report.objeto || user?.objetoContrato || 'PRESTAR LOS SERVICIOS PROFESIONALES Y DE APOYO A LA GESTIÓN EN EL MUNICIPIO DE QUIBDÓ.',
+        valor_contrato: cleanNumeric(report.valorContrato || user?.valorContrato),
+        cdp_nro: report.cdpNro || user?.cdpNro || '137',
+        crp_nro: report.crpNro || user?.crpNro || '191',
+        poliza_nro: report.polizaNro && report.polizaNro !== 'N/A' ? report.polizaNro : null,
+        fecha_aprobacion_poliza: parseDateForPg(report.fechaPoliza, '2026-01-15'),
+        plazo_meses: parsePlazoToMeses(report.plazo),
+        fecha_inicio: parseDateForPg(report.fechaInicio, '2026-01-15') || '2026-01-15',
+        fecha_terminacion: parseDateForPg(report.fechaTerminacion, '2026-07-14') || '2026-07-14',
+        supervisor_nombre: report.supervisorNombre || user?.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA',
+        supervisor_documento: report.supervisorDocumento || user?.supervisorDocumento || '35.602.521',
+        apoyo_supervision_nombre: report.apoyoSupervisionNombre && report.apoyoSupervisionNombre !== 'N/A' ? report.apoyoSupervisionNombre : null,
+        apoyo_supervision_documento: report.apoyoSupervisionDocumento && report.apoyoSupervisionDocumento !== 'N/A' ? report.apoyoSupervisionDocumento : null,
+        numero_cuenta: report.numeroCuenta || user?.numeroCuenta || '',
+        banco: report.banco || user?.banco || '',
+        tipo_cuenta: report.tipoCuenta || user?.tipoCuenta || 'AHORRO',
+        ciudad: report.ciudad || report.ciudadCuenta || user?.ciudad || '',
+        vigencia: 2026
+      };
+
+      // Actualizar la dirección en la tabla profiles si viene especificada
+      const dirVal = report.direccion || report.barrio || report.contratistaDireccion || user?.direccion || user?.barrio;
+      if (validContratistaId && dirVal) {
+        await supabase.from('profiles').update({ direccion: dirVal }).eq('id', validContratistaId);
+      }
+
+      // 3. Buscar si ya existe contrato exclusivamente para este contratista_id y sincronizar cambios
+      if (validContratistaId) {
+        const { data: existingContract } = await supabase
+          .from('contratos')
+          .select('id, contrato_nro')
+          .eq('contratista_id', validContratistaId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (existingContract?.id) {
+          const isValNro = (n?: any) => n && String(n).trim() !== '' && !/^20\d{2}$/.test(String(n));
+          if (existingContract.contrato_nro && isValNro(existingContract.contrato_nro) && (!contractPayload.contrato_nro || !isValNro(contractPayload.contrato_nro))) {
+            contractPayload.contrato_nro = existingContract.contrato_nro;
+          }
+          await supabase
+            .from('contratos')
+            .update(contractPayload)
+            .eq('id', existingContract.id);
+          return existingContract.id;
+        }
+      }
+
+      // Si no existe contrato para este contratista_id, insertar un nuevo contrato independiente
+      const { data: newContract, error: errContract } = await supabase
+        .from('contratos')
+        .insert([contractPayload])
+        .select('id')
+        .single();
+
+      if (!errContract && newContract?.id) {
+        return newContract.id;
+      } else if (errContract) {
+        console.warn('Error creating contract in PostgreSQL:', errContract);
+      }
+
+      return null;
+    } catch (e) {
+      console.warn('Error in ensureContrato:', e);
+      return null;
+    }
+  },
+
+  // 8. Informes Mensuales (Lectura en tiempo real de Supabase para Secretaría y Super Admin - Excluye Borradores no radicados)
+  async getInformes(secretariaId?: string): Promise<InformeSummary[]> {
+    try {
+      let query = supabase
+        .from('informes_mensuales')
+        .select(`
+          id,
+          contrato_id,
+          informe_nro,
+          tipo_informe,
+          fecha_presentacion,
+          periodo_desde,
+          periodo_hasta,
+          observaciones,
+          estado,
+          created_at,
+          contratos:contrato_id!inner (
+            contrato_nro,
+            secretaria_id,
+            profiles:contratista_id (
+              nombre_completo,
+              documento_identidad,
+              direccion
+            ),
+            sec_secretarias:secretaria_id (
+              nombre
+            )
+          )
+        `)
+        .neq('estado', 'Borrador')
+        .order('created_at', { ascending: false });
+
+      if (secretariaId) {
+        query = query.eq('contratos.secretaria_id', secretariaId);
+      }
+
+      const { data, error } = await query;
+
+      if (!error && data && data.length > 0) {
+        return data
+          .filter((row: any) => row.contratos !== null && row.estado !== 'Borrador')
+          .map((row: any) => {
+          const { comments: obsComments } = parseObservacionesAndComments(row.observaciones);
+          let dbComments = (row.comentarios_campos && typeof row.comentarios_campos === 'object' && Object.keys(row.comentarios_campos).length > 0)
+            ? row.comentarios_campos
+            : ((obsComments && typeof obsComments === 'object' && Object.keys(obsComments).length > 0) ? obsComments : null);
+          if (typeof dbComments === 'string') {
+            try { dbComments = JSON.parse(dbComments); } catch (e) {}
+          }
+          const doc = row.contratos?.profiles?.documento_identidad;
+          const infNro = row.informe_nro ? String(row.informe_nro) : '1';
+          const storedComm = getStoredComments(doc, infNro);
+          const comments = (dbComments && typeof dbComments === 'object' && Object.keys(dbComments).length > 0) 
+            ? dbComments 
+            : ((storedComm && typeof storedComm === 'object' && Object.keys(storedComm).length > 0) ? storedComm : (obsComments || {}));
+          const hasComments = comments && Object.keys(comments).length > 0;
+          const finalStatus = mapStatusFromDb(row.estado, hasComments);
+
+          return {
+            id: row.id,
+            contrato_id: row.contrato_id,
+            informe_nro: infNro,
+            tipo_informe: row.tipo_informe || 'Mensual',
+            fecha_presentacion: row.fecha_presentacion || '',
+            periodo_desde: row.periodo_desde || '',
+            periodo_hasta: row.periodo_hasta || '',
+            estado: finalStatus,
+            contratista_nombre: row.contratos?.profiles?.nombre_completo || 'CONTRATISTA MUNICIPAL',
+            contratista_documento: doc || '',
+            contrato_nro: row.contratos?.contrato_nro || '001',
+            secretaria_nombre: row.contratos?.sec_secretarias?.nombre || 'Secretaría Municipal',
+            created_at: row.created_at || new Date().toISOString(),
+            comentariosCampos: comments,
+          };
+        })
+        .filter((inf: InformeSummary) => inf.estado !== 'Borrador');
+      }
+
+      return [];
+    } catch (err) {
+      console.warn('Error fetching reports from Supabase:', err);
+      return [];
+    }
+  },
+
+  // 8.1. Cargar Informes Específicos de un Contratista con sus Obligaciones y Fotos de Supabase
+  async getReportById(reportId: string): Promise<ReportData | null> {
+    try {
+      const { data, error } = await supabase
+        .from('informes_mensuales')
+        .select(`
+          id,
+          contrato_id,
+          informe_nro,
+          tipo_informe,
+          fecha_presentacion,
+          periodo_desde,
+          periodo_hasta,
+          valor_adicion,
+          valor_pagar_certificado,
+          modificaciones_contrato,
+          observaciones,
+          estado,
+          created_at,
+          contratos:contrato_id (
+            contrato_nro,
+            objeto,
+            valor_contrato,
+            cdp_nro,
+            crp_nro,
+            poliza_nro,
+            fecha_aprobacion_poliza,
+            plazo_meses,
+            fecha_inicio,
+            fecha_terminacion,
+            supervisor_nombre,
+            supervisor_documento,
+            apoyo_supervision_nombre,
+            apoyo_supervision_documento,
+            secretaria_id,
+            numero_cuenta,
+            banco,
+            tipo_cuenta,
+            ciudad,
+            profiles:contratista_id (
+              id,
+              nombre_completo,
+              documento_identidad,
+              email,
+              telefono,
+              direccion
+            ),
+            sec_secretarias:secretaria_id (
+              id,
+              nombre,
+              codigo,
+              nit
+            )
+          ),
+          informe_obligaciones (
+            id,
+            obligacion_descripcion,
+            actividades_realizadas,
+            soportes_texto,
+            orden
+          ),
+          informe_anexos (
+            id,
+            titulo,
+            imagen_url,
+            orden
+          )
+        `)
+        .eq('id', reportId)
+        .maybeSingle();
+
+      if (!error && data) {
+        const row = data as any;
+        const obs = (row.informe_obligaciones || [])
+          .sort((a: any, b: any) => (a.orden || 0) - (b.orden || 0))
+          .map((o: any) => ({
+            id: o.id,
+            descripcion: o.obligacion_descripcion || '',
+            actividades: o.actividades_realizadas || '',
+            soportes: o.soportes_texto || 'Anexo fotográfico',
+          }));
+
+        const anx = (row.informe_anexos || [])
+          .sort((a: any, b: any) => (a.orden || 0) - (b.orden || 0))
+          .map((a: any) => ({
+            id: a.id,
+            titulo: a.titulo || '',
+            imagenUrl: a.imagen_url || '',
+          }));
+
+        const { cleanObs, comments: obsComments, valorPagarText, plazoText, valorMensualText, fechaRegistroPresupuestalText, codigoRubroText, numeroCuentaText, bancoText, tipoCuentaText, ciudadText } = parseObservacionesAndComments(row.observaciones);
+        let dbComments = (row.comentarios_campos && typeof row.comentarios_campos === 'object' && Object.keys(row.comentarios_campos).length > 0)
+          ? row.comentarios_campos
+          : ((obsComments && typeof obsComments === 'object' && Object.keys(obsComments).length > 0) ? obsComments : null);
+        if (typeof dbComments === 'string') {
+          try { dbComments = JSON.parse(dbComments); } catch (e) {}
+        }
+        const docIdentidad = row.contratos?.profiles?.documento_identidad || '';
+        const infNumStr = String(row.informe_nro || '1');
+        const storedComm = getStoredComments(docIdentidad, infNumStr);
+        const finalComments = (dbComments && typeof dbComments === 'object' && Object.keys(dbComments).length > 0)
+          ? dbComments
+          : ((storedComm && typeof storedComm === 'object' && Object.keys(storedComm).length > 0) ? storedComm : (obsComments || {}));
+        const hasComm = Object.keys(finalComments).length > 0;
+        const finalState = mapStatusFromDb(row.estado, hasComm);
+
+        const storedData = getStoredReportData(docIdentidad, infNumStr);
+        const { obsWithFotos, allAnexos } = associateFotosToObligaciones(obs, anx, storedData?.obligaciones);
+
+        const numCert = row.valor_pagar_certificado ? Number(row.valor_pagar_certificado) : 0;
+        let finalValorPagar = '';
+        if (numCert > 0) {
+          const rawLetters = valorPagarText ? valorPagarText.replace(/\([^)]*\)/g, '').replace(/\$\s*[\d.,]+/g, '').trim() : '';
+          const finalLetters = (rawLetters && rawLetters.length > 5 && /[a-zA-Z]/.test(rawLetters)) 
+            ? (rawLetters.toUpperCase().includes('PESOS') ? rawLetters.toUpperCase() : `${rawLetters.toUpperCase()} PESOS M/CTE`)
+            : convertirNumeroALetras(numCert);
+          finalValorPagar = `${finalLetters} ($${numCert.toLocaleString('es-CO')})`;
+        } else if (valorPagarText) {
+          finalValorPagar = valorPagarText;
+        } else if (storedData?.valorPagar) {
+          finalValorPagar = storedData.valorPagar;
+        } else {
+          finalValorPagar = '$ 2.160.000';
+        }
+
+        return {
+          id: row.id,
+          contratoId: row.contrato_id,
+          secretariaId: row.contratos?.sec_secretarias?.id,
+          secretariaNombre: row.contratos?.sec_secretarias?.nombre || 'Secretaría de Inclusión y Cohesión Social',
+          secretariaCodigo: row.contratos?.sec_secretarias?.codigo || '170',
+          secretariaNit: row.contratos?.sec_secretarias?.nit || '891680011-0',
+          fechaAplicacion: (storedData?.fechaAplicacion || formatFechaAplicacion(row.periodo_hasta, row.periodo_desde)).toUpperCase(),
+          tipoInforme: row.tipo_informe || 'Mensual',
+          informeNro: infNumStr,
+          fechaPresentacion: row.fecha_presentacion || new Date().toLocaleDateString('es-CO'),
+          periodoDesde: row.periodo_desde || '01/07/2026',
+          periodoHasta: row.periodo_hasta || '31/07/2026',
+          contratistaNombre: row.contratos?.profiles?.nombre_completo || 'CONTRATISTA',
+          contratistaDocumento: docIdentidad,
+          contratistaCorreo: row.contratos?.profiles?.email || '',
+          contratistaTelefono: row.contratos?.profiles?.telefono || '',
+          supervisorNombre: row.contratos?.supervisor_nombre || 'DIANA ANDREA MOSQUERA GARCIA',
+          supervisorDocumento: row.contratos?.supervisor_documento || '35.602.521',
+          apoyoSupervisionNombre: row.contratos?.apoyo_supervision_nombre || 'N/A',
+          apoyoSupervisionDocumento: row.contratos?.apoyo_supervision_documento || 'N/A',
+          valorContrato: formatColombianCurrency(row.contratos?.valor_contrato || '20029800'),
+          valorMensual: valorMensualText || storedData?.valorMensual || '',
+          valorAdicion: formatValorAdicion(row.valor_adicion),
+          contratoNro: row.contratos?.contrato_nro || '',
+          objeto: row.contratos?.objeto || '',
+          cdpNro: row.contratos?.cdp_nro || '137',
+          crpNro: row.contratos?.crp_nro || '191',
+          polizaNro: row.contratos?.poliza_nro || 'N/A',
+          fechaPoliza: formatDateSlash(row.contratos?.fecha_aprobacion_poliza || 'N/A'),
+          plazo: formatPlazoLetraYNumero(plazoText || storedData?.plazo || (row.contratos?.plazo_meses ? `${row.contratos.plazo_meses} MESES` : 'SEIS(6) MESES')),
+          fechaInicio: formatDateSlash(row.contratos?.fecha_inicio || '15/01/2026'),
+          fechaTerminacion: formatDateSlash(row.contratos?.fecha_terminacion || '14/07/2026'),
+          modificaciones: row.modificaciones_contrato || 'N/A',
+          observaciones: cleanObs,
+          obligaciones: obsWithFotos,
+          anexos: allAnexos,
+          valorPagar: finalValorPagar,
+          estado: finalState,
+          comentariosCampos: finalComments,
+          numeroCuenta: numeroCuentaText || storedData?.numeroCuenta || (row.contratos as any)?.numero_cuenta || '',
+          banco: bancoText || storedData?.banco || (row.contratos as any)?.banco || '',
+          tipoCuenta: tipoCuentaText || storedData?.tipoCuenta || (row.contratos as any)?.tipo_cuenta || 'AHORRO',
+          ciudad: ciudadText || storedData?.ciudad || storedData?.ciudadCuenta || (row.contratos as any)?.ciudad || '',
+          ciudadCuenta: ciudadText || storedData?.ciudadCuenta || storedData?.ciudad || (row.contratos as any)?.ciudad || '',
+          barrio: (row.contratos?.profiles as any)?.direccion || (row.contratos?.profiles as any)?.barrio || storedData?.barrio || storedData?.direccion || '',
+          direccion: (row.contratos?.profiles as any)?.direccion || (row.contratos?.profiles as any)?.barrio || storedData?.direccion || storedData?.barrio || '',
+          contratistaDireccion: (row.contratos?.profiles as any)?.direccion || (row.contratos?.profiles as any)?.barrio || storedData?.contratistaDireccion || storedData?.barrio || storedData?.direccion || '',
+          fechaRegistroPresupuestal: fechaRegistroPresupuestalText ? formatDateSlash(fechaRegistroPresupuestalText) : (storedData?.fechaRegistroPresupuestal ? formatDateSlash(storedData.fechaRegistroPresupuestal) : ''),
+          codigoRubro: codigoRubroText || storedData?.codigoRubro || '',
+          syncedToDb: true,
+        };
+      }
+    } catch (err) {
+      console.warn('Error in getReportById from Supabase:', err);
+    }
+    return null;
+  },
+
+  // 8.2. Cargar Informes Específicos de un Contratista con sus Obligaciones y Fotos de Supabase
+  async getContractorReports(contractorDocument?: string, contractorId?: string): Promise<ReportData[] | null> {
+    try {
+      const { data, error } = await supabase
+        .from('informes_mensuales')
+        .select(`
+          id,
+          contrato_id,
+          informe_nro,
+          tipo_informe,
+          fecha_presentacion,
+          periodo_desde,
+          periodo_hasta,
+          valor_adicion,
+          valor_pagar_certificado,
+          modificaciones_contrato,
+          observaciones,
+          estado,
+          created_at,
+          contratos:contrato_id (
+            contrato_nro,
+            objeto,
+            valor_contrato,
+            cdp_nro,
+            crp_nro,
+            poliza_nro,
+            fecha_aprobacion_poliza,
+            plazo_meses,
+            fecha_inicio,
+            fecha_terminacion,
+            supervisor_nombre,
+            supervisor_documento,
+            apoyo_supervision_nombre,
+            apoyo_supervision_documento,
+            secretaria_id,
+            numero_cuenta,
+            banco,
+            tipo_cuenta,
+            ciudad,
+            profiles:contratista_id (
+              id,
+              nombre_completo,
+              documento_identidad,
+              email,
+              telefono,
+              direccion
+            ),
+            sec_secretarias:secretaria_id (
+              id,
+              nombre,
+              codigo,
+              nit
+            )
+          ),
+          informe_obligaciones (
+            id,
+            obligacion_descripcion,
+            actividades_realizadas,
+            soportes_texto,
+            orden
+          ),
+          informe_anexos (
+            id,
+            titulo,
+            imagen_url,
+            orden
+          )
+        `)
+        .order('informe_nro', { ascending: false });
+
+      if (!error && data && data.length > 0) {
+        const filtered = data.filter((row: any) => {
+          if (!contractorDocument && !contractorId) return true;
+          const rowDoc = row.contratos?.profiles?.documento_identidad;
+          const rowProfId = row.contratos?.profiles?.id;
+          return (contractorDocument && rowDoc === contractorDocument) || (contractorId && rowProfId === contractorId);
+        });
+
+        if (filtered.length > 0) {
+          const mapped = filtered.map((row: any) => {
+            const obs = (row.informe_obligaciones || [])
+              .sort((a: any, b: any) => (a.orden || 0) - (b.orden || 0))
+              .map((o: any) => ({
+                id: o.id,
+                descripcion: o.obligacion_descripcion || '',
+                actividades: o.actividades_realizadas || '',
+                soportes: o.soportes_texto || 'Anexo fotográfico',
+              }));
+
+            const anx = (row.informe_anexos || [])
+              .sort((a: any, b: any) => (a.orden || 0) - (b.orden || 0))
+              .map((a: any) => ({
+                id: a.id,
+                titulo: a.titulo || '',
+                imagenUrl: a.imagen_url || '',
+              }));
+
+            const { cleanObs, comments: obsComments, valorPagarText, plazoText, valorMensualText, fechaRegistroPresupuestalText, codigoRubroText, numeroCuentaText, bancoText, tipoCuentaText, ciudadText } = parseObservacionesAndComments(row.observaciones);
+            let dbComments = (row.comentarios_campos && typeof row.comentarios_campos === 'object' && Object.keys(row.comentarios_campos).length > 0)
+              ? row.comentarios_campos
+              : ((obsComments && typeof obsComments === 'object' && Object.keys(obsComments).length > 0) ? obsComments : null);
+            if (typeof dbComments === 'string') {
+              try { dbComments = JSON.parse(dbComments); } catch (e) {}
+            }
+            const docIdentidad = row.contratos?.profiles?.documento_identidad || contractorDocument || '';
+            const infNumStr = String(row.informe_nro || '1');
+            const storedComm = getStoredComments(docIdentidad, infNumStr);
+            const finalComments = row.estado === 'Borrador' ? {} : (
+              (dbComments && typeof dbComments === 'object' && Object.keys(dbComments).length > 0)
+                ? dbComments
+                : ((storedComm && typeof storedComm === 'object' && Object.keys(storedComm).length > 0) ? storedComm : (obsComments || {}))
+            );
+            const hasComm = Object.keys(finalComments).length > 0;
+            const finalState = mapStatusFromDb(row.estado, hasComm);
+
+            const storedData = getStoredReportData(docIdentidad, infNumStr);
+            const { obsWithFotos, allAnexos } = associateFotosToObligaciones(obs, anx, storedData?.obligaciones);
+
+            const numCert = row.valor_pagar_certificado ? Number(row.valor_pagar_certificado) : 0;
+            let finalValorPagar = '';
+            if (numCert > 0) {
+              const rawLetters = valorPagarText ? valorPagarText.replace(/\([^)]*\)/g, '').replace(/\$\s*[\d.,]+/g, '').trim() : '';
+              const finalLetters = (rawLetters && rawLetters.length > 5 && /[a-zA-Z]/.test(rawLetters)) 
+                ? (rawLetters.toUpperCase().includes('PESOS') ? rawLetters.toUpperCase() : `${rawLetters.toUpperCase()} PESOS M/CTE`)
+                : convertirNumeroALetras(numCert);
+              finalValorPagar = `${finalLetters} ($${numCert.toLocaleString('es-CO')})`;
+            } else if (valorPagarText) {
+              finalValorPagar = valorPagarText;
+            } else if (storedData?.valorPagar) {
+              finalValorPagar = storedData.valorPagar;
+            } else {
+              finalValorPagar = '$ 2.160.000';
+            }
+
+            return {
+              id: row.id,
+              contratoId: row.contrato_id,
+              secretariaId: row.contratos?.sec_secretarias?.id,
+              secretariaNombre: row.contratos?.sec_secretarias?.nombre || 'Secretaría de Inclusión y Cohesión Social',
+              secretariaCodigo: row.contratos?.sec_secretarias?.codigo || '170',
+              secretariaNit: row.contratos?.sec_secretarias?.nit || '891680011-0',
+              fechaAplicacion: (storedData?.fechaAplicacion || formatFechaAplicacion(row.periodo_hasta, row.periodo_desde)).toUpperCase(),
+              tipoInforme: row.tipo_informe || 'Mensual',
+              informeNro: infNumStr,
+              fechaPresentacion: row.fecha_presentacion || new Date().toLocaleDateString('es-CO'),
+              periodoDesde: row.periodo_desde || '01/07/2026',
+              periodoHasta: row.periodo_hasta || '31/07/2026',
+              contratistaNombre: row.contratos?.profiles?.nombre_completo || 'CONTRATISTA',
+              contratistaDocumento: docIdentidad,
+              contratistaCorreo: row.contratos?.profiles?.email || '',
+              contratistaTelefono: row.contratos?.profiles?.telefono || '',
+              supervisorNombre: row.contratos?.supervisor_nombre || 'DIANA ANDREA MOSQUERA GARCIA',
+              supervisorDocumento: row.contratos?.supervisor_documento || '35.602.521',
+              apoyoSupervisionNombre: row.contratos?.apoyo_supervision_nombre || 'N/A',
+              apoyoSupervisionDocumento: row.contratos?.apoyo_supervision_documento || 'N/A',
+              valorContrato: formatColombianCurrency(row.contratos?.valor_contrato || '20029800'),
+              valorMensual: valorMensualText || storedData?.valorMensual || '',
+              valorAdicion: formatValorAdicion(row.valor_adicion),
+              contratoNro: row.contratos?.contrato_nro || '',
+              objeto: row.contratos?.objeto || '',
+              cdpNro: row.contratos?.cdp_nro || '137',
+              crpNro: row.contratos?.crp_nro || '191',
+              polizaNro: row.contratos?.poliza_nro || 'N/A',
+              fechaPoliza: formatDateSlash(row.contratos?.fecha_aprobacion_poliza || 'N/A'),
+              plazo: formatPlazoLetraYNumero(plazoText || storedData?.plazo || (row.contratos?.plazo_meses ? `${row.contratos.plazo_meses} MESES` : 'SEIS(6) MESES')),
+              fechaInicio: formatDateSlash(row.contratos?.fecha_inicio || '15/01/2026'),
+              fechaTerminacion: formatDateSlash(row.contratos?.fecha_terminacion || '14/07/2026'),
+              modificaciones: row.modificaciones_contrato || 'N/A',
+              observaciones: cleanObs,
+              rawObservacionesDb: row.observaciones || '',
+              obligaciones: obsWithFotos,
+              anexos: allAnexos,
+              valorPagar: finalValorPagar,
+              valorPagarCertificado: row.valor_pagar_certificado || (numCert ? String(numCert) : ''),
+              estado: finalState,
+              comentariosCampos: finalComments,
+              numeroCuenta: numeroCuentaText || storedData?.numeroCuenta || (row.contratos as any)?.numero_cuenta || '',
+              banco: bancoText || storedData?.banco || (row.contratos as any)?.banco || '',
+              tipoCuenta: tipoCuentaText || storedData?.tipoCuenta || (row.contratos as any)?.tipo_cuenta || 'AHORRO',
+              ciudad: ciudadText || storedData?.ciudad || storedData?.ciudadCuenta || (row.contratos as any)?.ciudad || '',
+              ciudadCuenta: ciudadText || storedData?.ciudadCuenta || storedData?.ciudad || (row.contratos as any)?.ciudad || '',
+              barrio: (row.contratos?.profiles as any)?.direccion || (row.contratos?.profiles as any)?.barrio || storedData?.barrio || storedData?.direccion || '',
+              direccion: (row.contratos?.profiles as any)?.direccion || (row.contratos?.profiles as any)?.barrio || storedData?.direccion || storedData?.barrio || '',
+              contratistaDireccion: (row.contratos?.profiles as any)?.direccion || (row.contratos?.profiles as any)?.barrio || storedData?.contratistaDireccion || storedData?.barrio || storedData?.direccion || '',
+              fechaRegistroPresupuestal: fechaRegistroPresupuestalText ? formatDateSlash(fechaRegistroPresupuestalText) : (storedData?.fechaRegistroPresupuestal ? formatDateSlash(storedData.fechaRegistroPresupuestal) : ''),
+              codigoRubro: codigoRubroText || storedData?.codigoRubro || '',
+              syncedToDb: true,
+            };
+          });
+
+          // Deduplicar informes por número de informe (manteniendo la versión más completa/reciente)
+          const uniqueMap = new Map<string, ReportData>();
+          for (const rep of mapped) {
+            if (!uniqueMap.has(rep.informeNro)) {
+              uniqueMap.set(rep.informeNro, rep);
+            } else {
+              const existing = uniqueMap.get(rep.informeNro)!;
+              if (!isUuid(existing.id) && isUuid(rep.id)) {
+                uniqueMap.set(rep.informeNro, rep);
+              } else if ((rep.obligaciones?.length || 0) > (existing.obligaciones?.length || 0)) {
+                uniqueMap.set(rep.informeNro, rep);
+              }
+            }
+          }
+          return Array.from(uniqueMap.values());
+        }
+      }
+    } catch (err) {
+      console.warn('Error in getContractorReports from Supabase:', err);
+      return null;
+    }
+
+    return [];
+  },
+
+  // 9. Guardar / Sincronizar Informe Completo a Supabase (Garantizando Contrato, Obligaciones y Fotos)
+  async saveFullInforme(report: ReportData, user?: AuthUser): Promise<{ success: boolean; id?: string; error?: string; obligaciones?: Obligacion[]; anexos?: Anexo[] }> {
+    try {
+      // 1. Asegurar Contrato ID válido y sincronizar fechas del contrato
+      let contratoId = report.contratoId;
+      if (!contratoId || !isUuid(contratoId)) {
+        contratoId = (await this.ensureContrato(report, user)) || undefined;
+      } else {
+        // Actualizar datos del contrato existente (fechas de inicio y terminación, etc.)
+        const parsePlazoToMeses = (plazoStr?: string): number => {
+          if (!plazoStr) return 6;
+          const parsed = parsePlazoComponents(plazoStr);
+          return parsed.meses || 6;
+        };
+
+        const parseDateForContract = (dateStr?: string, defaultDate: string = '2026-01-15'): string | null => {
+          if (!dateStr || dateStr === 'N/A') return null;
+          if (dateStr.includes('/')) {
+            const parts = dateStr.split('/');
+            if (parts.length === 3) {
+              const yr = parts[2].length === 2 ? `20${parts[2]}` : parts[2];
+              return `${yr}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+            }
+          }
+          if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+          return defaultDate;
+        };
+
+        const cleanContractVal = (val?: string | number): number => {
+          if (typeof val === 'number') return val;
+          if (!val) return 20029800;
+          const cleaned = val.toString().replace(/[^0-9]/g, '');
+          return parseInt(cleaned, 10) || 20029800;
+        };
+
+        const cleanContractNroVal = extractContratoNroOnly(report.contratoNro);
+        try {
+          await supabase.from('contratos').update({
+            ...(cleanContractNroVal ? { contrato_nro: cleanContractNroVal } : {}),
+            fecha_inicio: parseDateForContract(report.fechaInicio, '2026-01-15') || '2026-01-15',
+            fecha_terminacion: parseDateForContract(report.fechaTerminacion, '2026-07-14') || '2026-07-14',
+            plazo_meses: parsePlazoToMeses(report.plazo),
+            objeto: report.objeto,
+            valor_contrato: cleanContractVal(report.valorContrato),
+            cdp_nro: report.cdpNro || '137',
+            crp_nro: report.crpNro || '191',
+            poliza_nro: report.polizaNro && report.polizaNro !== 'N/A' ? report.polizaNro : null,
+            fecha_aprobacion_poliza: parseDateForContract(report.fechaPoliza, '2026-01-15'),
+            supervisor_nombre: report.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA',
+            supervisor_documento: report.supervisorDocumento || '35.602.521',
+            apoyo_supervision_nombre: report.apoyoSupervisionNombre && report.apoyoSupervisionNombre !== 'N/A' ? report.apoyoSupervisionNombre : null,
+            apoyo_supervision_documento: report.apoyoSupervisionDocumento && report.apoyoSupervisionDocumento !== 'N/A' ? report.apoyoSupervisionDocumento : null,
+            numero_cuenta: report.numeroCuenta || user?.numeroCuenta || '',
+            banco: report.banco || user?.banco || '',
+            tipo_cuenta: report.tipoCuenta || user?.tipoCuenta || 'AHORRO',
+            ciudad: report.ciudad || report.ciudadCuenta || user?.ciudad || '',
+          }).eq('id', contratoId);
+
+          const dirVal = report.direccion || report.barrio || report.contratistaDireccion;
+          const contractorDoc = report.contratistaDocumento || user?.documentoIdentidad;
+          if (dirVal && contractorDoc) {
+            await supabase.from('profiles').update({ direccion: dirVal }).eq('documento_identidad', contractorDoc);
+          }
+        } catch (contractErr) {
+          console.warn('Error updating contract fields in saveFullInforme:', contractErr);
+        }
+      }
+
+      const cleanNumeric = (val?: string | number, defaultVal: number = 0): number => {
+        if (typeof val === 'number') return val;
+        if (!val) return defaultVal;
+        const cleaned = val.toString().replace(/[^0-9]/g, '');
+        return parseInt(cleaned, 10) || defaultVal;
+      };
+
+      const parseDateForPg = (dateStr?: string, defaultDate: string = '2026-07-15'): string => {
+        if (!dateStr || dateStr === 'N/A') return defaultDate;
+        if (dateStr.includes('/')) {
+          const parts = dateStr.split('/');
+          if (parts.length === 3) {
+            return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+          }
+        }
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+        return defaultDate;
+      };
+
+      const contractorDoc = report.contratistaDocumento || user?.documentoIdentidad;
+      const cleanObsText = report.observaciones !== undefined && report.observaciones !== null ? report.observaciones : '';
+      const fullObsPayload = buildObservacionesWithComments(
+        cleanObsText, 
+        report.comentariosCampos, 
+        report.valorPagar, 
+        report.plazo, 
+        report.valorMensual,
+        report.fechaRegistroPresupuestal,
+        report.codigoRubro,
+        report.numeroCuenta,
+        report.banco,
+        report.tipoCuenta,
+        report.ciudad || report.ciudadCuenta
+      );
+
+      const parsedValorPagar = limpiarNumeroMoneda(report.valorPagar) || 3338300;
+
+      const informePayload: any = {
+        informe_nro: parseInt(report.informeNro, 10) || 1,
+        tipo_informe: report.tipoInforme || 'Mensual',
+        fecha_presentacion: parseDateForPg(report.fechaPresentacion || report.periodoHasta, new Date().toISOString().split('T')[0]),
+        periodo_desde: parseDateForPg(report.periodoDesde, '2026-07-01'),
+        periodo_hasta: parseDateForPg(report.periodoHasta, '2026-07-31'),
+        valor_adicion: limpiarNumeroMoneda(report.valorAdicion),
+        valor_pagar_certificado: parsedValorPagar,
+        modificaciones_contrato: report.modificaciones || 'N/A',
+        observaciones: fullObsPayload,
+        estado: mapStatusToDb(report.estado || 'Enviado'),
+      };
+
+      if (report.comentariosCampos && typeof localStorage !== 'undefined') {
+        if (contractorDoc) {
+          localStorage.setItem(`informe_comentarios_${contractorDoc}_${report.informeNro}`, JSON.stringify(report.comentariosCampos));
+          localStorage.setItem(`informe_comments_${contractorDoc}_${report.informeNro}`, JSON.stringify(report.comentariosCampos));
+        } else {
+          localStorage.setItem(`informe_comentarios_${report.informeNro}`, JSON.stringify(report.comentariosCampos));
+          localStorage.setItem(`informe_comments_${report.informeNro}`, JSON.stringify(report.comentariosCampos));
+        }
+      }
+
+      if (contratoId && isUuid(contratoId)) {
+        informePayload.contrato_id = contratoId;
+      }
+
+      let informeId = report.id;
+
+      // Buscar si ya existe un registro en Supabase para este contrato con el mismo número de informe
+      if (!informeId || !isUuid(informeId)) {
+        if (contratoId && isUuid(contratoId)) {
+          const { data: existing } = await supabase
+            .from('informes_mensuales')
+            .select('id')
+            .eq('contrato_id', contratoId)
+            .eq('informe_nro', parseInt(report.informeNro, 10) || 1)
+            .maybeSingle();
+
+          if (existing?.id) {
+            informeId = existing.id;
+          }
+        }
+      }
+
+      if (!informeId || !isUuid(informeId)) {
+        const { data: inserted, error: insertError } = await supabase
+          .from('informes_mensuales')
+          .insert([informePayload])
+          .select('id')
+          .maybeSingle();
+
+        if (inserted?.id) {
+          informeId = inserted.id;
+        } else if (insertError) {
+          console.warn('Insert error in informes_mensuales:', insertError);
+        }
+      } else {
+        await supabase
+          .from('informes_mensuales')
+          .update(informePayload)
+          .eq('id', informeId);
+      }
+
+      // 4. Procesar y Subir a Supabase Storage las fotos pendientes (Subida Diferida por obligación y generales)
+      const processedObligaciones: Obligacion[] = [];
+      const processedAnexos: Anexo[] = [];
+
+      for (let obsIdx = 0; obsIdx < (report.obligaciones || []).length; obsIdx++) {
+        const obs = report.obligaciones[obsIdx];
+        const obsFotos = (obs.fotos || []).slice(0, 5);
+        const processedObsFotos: Anexo[] = [];
+
+        for (const foto of obsFotos) {
+          let finalUrl = foto.imagenUrl;
+          if (foto.file || (foto.imagenUrl && foto.imagenUrl.startsWith('data:image'))) {
+            let fileToUpload = foto.file;
+            if (!fileToUpload && foto.imagenUrl.startsWith('data:image')) {
+              try {
+                const res = await fetch(foto.imagenUrl);
+                const blob = await res.blob();
+                fileToUpload = new File([blob], `anexo_obs${obsIdx + 1}_${Date.now()}.jpg`, { type: blob.type || 'image/jpeg' });
+              } catch (e) {
+                console.warn('Error converting dataURL to file:', e);
+              }
+            }
+
+            if (fileToUpload) {
+              const uploadedUrl = await this.uploadImageToStorage(fileToUpload, 'anexos-fotos');
+              if (uploadedUrl) {
+                finalUrl = uploadedUrl;
+              }
+            }
+          }
+
+          const rawTitle = foto.titulo || `Evidencia ${processedObsFotos.length + 1}`;
+          const hasObligacionTag = rawTitle.toLowerCase().includes('obligación') || rawTitle.toLowerCase().includes('obligacion');
+          const finalTitle = hasObligacionTag ? rawTitle : `Obligación #${obsIdx + 1} - ${rawTitle}`;
+
+          const processedFoto: Anexo = {
+            id: foto.id,
+            titulo: finalTitle,
+            imagenUrl: finalUrl,
+            obligacionId: obs.id,
+            obligacionIndex: obsIdx + 1,
+            isPendingUpload: false
+          };
+
+          processedObsFotos.push(processedFoto);
+          processedAnexos.push(processedFoto);
+        }
+
+        processedObligaciones.push({
+          ...obs,
+          fotos: processedObsFotos
+        });
+      }
+
+      // Si había anexos en report.anexos que no estaban en ninguna obligación
+      if (report.anexos && report.anexos.length > 0) {
+        for (const anexo of report.anexos) {
+          // Si el anexo está marcado como perteneciente a una obligación o tiene un título de obligación, omitir para evitar duplicados o fotos huérfanas
+          const isObligacionPhoto = anexo.obligacionId || 
+                                    (anexo.obligacionIndex !== undefined && anexo.obligacionIndex > 0) ||
+                                    (anexo.titulo || '').toLowerCase().startsWith('obligación #') ||
+                                    (anexo.titulo || '').toLowerCase().startsWith('obligacion #');
+          if (isObligacionPhoto) {
+            continue;
+          }
+
+          if (!processedAnexos.some(a => a.id === anexo.id || a.imagenUrl === anexo.imagenUrl)) {
+            let finalUrl = anexo.imagenUrl;
+            if (anexo.file || (anexo.imagenUrl && anexo.imagenUrl.startsWith('data:image'))) {
+              let fileToUpload = anexo.file;
+              if (!fileToUpload && anexo.imagenUrl.startsWith('data:image')) {
+                try {
+                  const res = await fetch(anexo.imagenUrl);
+                  const blob = await res.blob();
+                  fileToUpload = new File([blob], `anexo_${Date.now()}.jpg`, { type: blob.type || 'image/jpeg' });
+                } catch (e) {}
+              }
+              if (fileToUpload) {
+                const uploadedUrl = await this.uploadImageToStorage(fileToUpload, 'anexos-fotos');
+                if (uploadedUrl) finalUrl = uploadedUrl;
+              }
+            }
+            processedAnexos.push({
+              id: anexo.id,
+              titulo: anexo.titulo,
+              imagenUrl: finalUrl,
+              isPendingUpload: false
+            });
+          }
+        }
+      }
+
+      // 5. Guardar Obligaciones y Anexos en Supabase
+      if (informeId && isUuid(informeId)) {
+        await supabase.from('informe_obligaciones').delete().eq('informe_id', informeId);
+
+        const obligacionesRows = processedObligaciones.map((o, idx) => ({
+          informe_id: informeId,
+          obligacion_descripcion: o.descripcion,
+          actividades_realizadas: o.actividades,
+          soportes_texto: o.soportes,
+          orden: idx + 1,
+        }));
+
+        if (obligacionesRows.length > 0) {
+          await supabase.from('informe_obligaciones').insert(obligacionesRows);
+        }
+
+        await supabase.from('informe_anexos').delete().eq('informe_id', informeId);
+        const anexosRows = processedAnexos.map((a, idx) => ({
+          informe_id: informeId,
+          titulo: a.titulo,
+          imagen_url: a.imagenUrl,
+          orden: idx + 1,
+        }));
+
+        if (anexosRows.length > 0) {
+          await supabase.from('informe_anexos').insert(anexosRows);
+        }
+      }
+
+      const updatedReportWithDb = {
+        ...report,
+        id: informeId,
+        contratoId: contratoId,
+        obligaciones: processedObligaciones,
+        anexos: processedAnexos,
+        syncedToDb: true,
+      };
+
+      if (typeof localStorage !== 'undefined') {
+        if (contractorDoc) {
+          localStorage.setItem(`alcaldia_quibdo_report_${contractorDoc}_${report.informeNro}`, JSON.stringify(updatedReportWithDb));
+        } else {
+          localStorage.setItem(`alcaldia_quibdo_report_${report.informeNro}`, JSON.stringify(updatedReportWithDb));
+        }
+      }
+
+      // Sincronizar automáticamente Certificado de Supervisión, Soporte Fiduciaria y Autorización de Desembolso en Supabase
+      try {
+        const certDataToSync = createDefaultCertificadoData(updatedReportWithDb);
+        // Excluir saldo_por_pagar y porcentaje_ejecucion al guardar o guardar cambios del informe mensual
+        await this.saveCertificadoSupervision(certDataToSync, informeId, undefined, contratoId, { excludeLiquidacion: true });
+
+        const fidDataToSync = createDefaultFiduciariaData(updatedReportWithDb);
+        await this.saveSoporteFiduciaria(informeId, fidDataToSync, contractorDoc, String(report.informeNro || '1'), contratoId);
+
+        const desembolsoDataToSync = createDefaultAutorizacionDesembolsoData(updatedReportWithDb);
+        await this.saveAutorizacionDesembolso(informeId, desembolsoDataToSync, contractorDoc, String(report.informeNro || '1'), contratoId);
+      } catch (certSyncErr) {
+        console.warn('Error syncing certificados/soportes in saveFullInforme:', certSyncErr);
+      }
+
+      return { 
+        success: true, 
+        id: informeId || `local-${Date.now()}`,
+        obligaciones: processedObligaciones,
+        anexos: processedAnexos
+      };
+    } catch (err: any) {
+      console.error('Error saving to Supabase:', err);
+      return { success: false, error: err?.message || 'Error de conexión' };
+    }
+  },
+
+  // 9.1. Guardar Observaciones por Campo de la Supervisora y Actualizar Estado
+  async saveReportComments(
+    reportId: string, 
+    informeNro: string, 
+    contractorDoc: string, 
+    comments: Record<string, FieldComment>,
+    newStatus: EstadoInforme = 'Devuelto'
+  ): Promise<boolean> {
+    const allCommentsList = Object.values(comments || {});
+    const pendingComments = allCommentsList.filter(c => !c.corregido);
+    const pendingMain = pendingComments.filter(isMainReportComment);
+    const fixedComments = allCommentsList.filter(c => Boolean(c.corregido));
+
+    // Si solo hay observaciones en certificados (2 al 5) y ninguna en el informe principal (1),
+    // se mantiene el estado del informe principal como 'Enviado' para evitar marcarlo como Devuelto en el dashboard.
+    let statusToSave = newStatus;
+    if (newStatus === 'Devuelto' && pendingMain.length === 0 && pendingComments.length > 0) {
+      statusToSave = 'Enviado';
+    }
+
+    // Marcar como leídas las notificaciones de radicado de este informe para el supervisor
+    this.marcarNotificacionesRadicadasComoLeidas(informeNro, reportId).catch(err => console.warn('Error marking radicado notifs as read:', err));
+
+    try {
+      if (isUuid(reportId)) {
+        const { data: currentReport } = await supabase
+          .from('informes_mensuales')
+          .select('observaciones, estado')
+          .eq('id', reportId)
+          .maybeSingle();
+
+        if (currentReport?.estado === 'Aprobado' || currentReport?.estado === 'aprobado' || newStatus === 'Aprobado') {
+          statusToSave = 'Aprobado';
+        } else if (newStatus === 'Devuelto' && pendingMain.length === 0 && pendingComments.length > 0) {
+          statusToSave = 'Enviado';
+        }
+
+        const { cleanObs, valorPagarText, plazoText, valorMensualText } = parseObservacionesAndComments(currentReport?.observaciones);
+        const newObsWithComments = buildObservacionesWithComments(cleanObs, comments, valorPagarText, plazoText, valorMensualText);
+
+        const updatePayload: any = { 
+          observaciones: newObsWithComments,
+          estado: mapStatusToDb(statusToSave) 
+        };
+
+        try {
+          updatePayload.comentarios_campos = comments;
+        } catch (e) {}
+
+        const { error: updErr } = await supabase
+          .from('informes_mensuales')
+          .update(updatePayload)
+          .eq('id', reportId);
+
+        if (updErr) {
+          await supabase
+            .from('informes_mensuales')
+            .update({ 
+              observaciones: newObsWithComments,
+              estado: mapStatusToDb(statusToSave) 
+            })
+            .eq('id', reportId);
+        }
+      }
+    } catch (e) {
+      console.warn('Error saving comments to Supabase:', e);
+    }
+
+    // Guardar respaldo inmediato en LocalStorage
+    if (typeof localStorage !== 'undefined') {
+      const docKey = contractorDoc ? `_${contractorDoc}` : '';
+      if (contractorDoc) {
+        localStorage.setItem(`informe_comments_${contractorDoc}_${informeNro}`, JSON.stringify(comments));
+        localStorage.setItem(`informe_comentarios_${contractorDoc}_${informeNro}`, JSON.stringify(comments));
+      } else {
+        localStorage.setItem(`informe_comments_${informeNro}`, JSON.stringify(comments));
+        localStorage.setItem(`informe_comentarios_${informeNro}`, JSON.stringify(comments));
+      }
+
+      const localKey = `informe_data${docKey}_${informeNro}`;
+      const saved = localStorage.getItem(localKey);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          parsed.comentariosCampos = comments;
+          parsed.estado = statusToSave;
+          localStorage.setItem(localKey, JSON.stringify(parsed));
+        } catch (e) {}
+      } else if (!contractorDoc) {
+        const globalSaved = localStorage.getItem(`informe_data_${informeNro}`);
+        if (globalSaved) {
+          try {
+            const parsed = JSON.parse(globalSaved);
+            parsed.comentariosCampos = comments;
+            parsed.estado = statusToSave;
+            localStorage.setItem(`informe_data_${informeNro}`, JSON.stringify(parsed));
+          } catch (e) {}
+        }
+      }
+    }
+
+    // 1. Notificación para el Contratista si hay observaciones pendientes
+    if (contractorDoc && (newStatus === 'Devuelto' || pendingComments.length > 0)) {
+      const docNamesSet = new Set<string>();
+      pendingComments.forEach(c => {
+        const fn = (c.nombreCampo || c.fieldName || '').toLowerCase();
+        const fid = (c.campoId || '').toLowerCase();
+        if (fid === 'certificado_supervision' || fn.includes('certificado de supervisión')) docNamesSet.add('Certificado de Supervisión');
+        else if (fid === 'soporte_fiduciaria' || fn.includes('fiduciaria') || fn.includes('pagos')) docNamesSet.add('Soporte Fiduciaria / Pagos');
+        else if (fid === 'declaracion_juramento' || fn.includes('declaración') || fn.includes('juramento')) docNamesSet.add('Declaración Bajo Juramento');
+        else if (fid === 'autorizacion_desembolso' || fn.includes('desembolso')) docNamesSet.add('Autorización de Desembolso');
+        else docNamesSet.add('Informe Mensual');
+      });
+
+      const docNames = Array.from(docNamesSet).join(', ') || 'Informe Mensual';
+      const bulletPoints = pendingComments.map((c, i) => `· ${c.nombreCampo || c.campoId || `Campo ${i + 1}`}: ${c.comentario}`).join('\n');
+      
+      const titulo = `⚠️ Observación en ${docNames} (Informe #${informeNro})`;
+      const mensaje = `La supervisión ha registrado observaciones en ${docNames} del Informe #${informeNro}:\n\n${bulletPoints}\n\nPor favor ingrese a la plataforma, corrija las casillas resaltadas en amarillo y presione "Radicar / Reenviar Informe".`;
+
+      this.crearNotificacion({
+        user_id: contractorDoc,
+        titulo,
+        mensaje,
+        tipo: 'devolucion',
+        leida: false,
+        informe_nro: informeNro,
+        report_id: isUuid(reportId) ? reportId : undefined
+      }).catch(err => console.warn('Error creating contractor notification:', err));
+    } else if (contractorDoc && pendingComments.length === 0) {
+      // Si ya no quedan observaciones pendientes, marcar como leídas/resueltas las notificaciones de devolución previas
+      this.marcarNotificacionesInformeResueltas(contractorDoc, informeNro, reportId).catch(err => console.warn('Error resolving notifications:', err));
+    }
+
+    // 2. Notificación para la Supervisora si el contratista marcó observaciones como SUBSANADAS
+    if (fixedComments.length > 0) {
+      const fixedDocsSet = new Set<string>();
+      fixedComments.forEach(c => {
+        const fn = (c.nombreCampo || c.fieldName || '').toLowerCase();
+        const fid = (c.campoId || '').toLowerCase();
+        if (fid === 'certificado_supervision' || fn.includes('certificado de supervisión')) fixedDocsSet.add('Certificado de Supervisión');
+        else if (fid === 'soporte_fiduciaria' || fn.includes('fiduciaria') || fn.includes('pagos')) fixedDocsSet.add('Soporte Fiduciaria');
+        else if (fid === 'declaracion_juramento' || fn.includes('declaración') || fn.includes('juramento')) fixedDocsSet.add('Declaración Bajo Juramento');
+        else if (fid === 'autorizacion_desembolso' || fn.includes('desembolso')) fixedDocsSet.add('Autorización de Desembolso');
+        else fixedDocsSet.add('Informe Mensual');
+      });
+
+      const fixedNames = Array.from(fixedDocsSet).join(', ') || 'Documento';
+      const titulo = `🟢 Subsanación Realizada en ${fixedNames} (Informe #${informeNro})`;
+      const mensaje = `El contratista ha corregido y marcado como subsanada la observación en ${fixedNames} del Informe #${informeNro}. Por favor ingrese a validar.`;
+
+      this.crearNotificacion({
+        user_id: 'supervisor',
+        titulo,
+        mensaje,
+        tipo: 'devolucion',
+        leida: false,
+        informe_nro: informeNro,
+        report_id: isUuid(reportId) ? reportId : undefined
+      }).catch(err => console.warn('Error creating supervisor notification:', err));
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+      window.dispatchEvent(new CustomEvent('informe_comments_updated'));
+    }
+
+    return true;
+  },
+
+  // 10. Eliminar Informe Completo (En Supabase, Almacenamiento de Fotos, Certificaciones, Documentos Asociados y Notificaciones)
+  async deleteFullInforme(
+    reportId?: string, 
+    informeNro?: string, 
+    contractorDoc?: string,
+    anexosList?: Anexo[]
+  ): Promise<boolean> {
+    try {
+      // 1. Eliminar fotografías del Storage si se pasaron en anexosList
+      if (anexosList && anexosList.length > 0) {
+        for (const anx of anexosList) {
+          if (anx.imagenUrl) {
+            await this.deleteImageFromStorage(anx.imagenUrl);
+          }
+        }
+      }
+
+      // Helper para limpiar tablas asociadas a un ID de informe
+      const purgeInformeTables = async (id: string) => {
+        // Consultar fotos asociadas en la tabla informe_anexos y borrarlas del Storage
+        const { data: dbAnexos } = await supabase
+          .from('informe_anexos')
+          .select('imagen_url')
+          .eq('informe_id', id);
+
+        if (dbAnexos && dbAnexos.length > 0) {
+          for (const anx of dbAnexos) {
+            if (anx.imagen_url) {
+              await this.deleteImageFromStorage(anx.imagen_url);
+            }
+          }
+        }
+
+        // Eliminar registros hijos y vinculados
+        await supabase.from('informe_obligaciones').delete().eq('informe_id', id);
+        await supabase.from('informe_anexos').delete().eq('informe_id', id);
+        await supabase.from('certificaciones_supervision').delete().eq('informe_id', id);
+        await supabase.from('soportes_fiduciaria').delete().eq('informe_id', id);
+        await supabase.from('declaraciones_renta').delete().eq('informe_id', id);
+        await supabase.from('autorizaciones_desembolso').delete().eq('informe_id', id);
+        await supabase.from('notificaciones').delete().eq('report_id', id);
+        await supabase.from('informes_mensuales').delete().eq('id', id);
+      };
+
+      // 2. Eliminar de Supabase por reportId UUID
+      if (reportId && isUuid(reportId)) {
+        await purgeInformeTables(reportId);
+        await supabase.from('notificaciones').delete().eq('report_id', reportId);
+      }
+
+      // 3. Eliminar por número de informe y documento del contratista (con aislamiento estricto)
+      if (informeNro && contractorDoc) {
+        // Encontrar contratos que pertenecen exclusivamente a este contratista
+        const { data: userContracts } = await supabase
+          .from('contratos')
+          .select('id, profiles!inner(documento_identidad)')
+          .eq('profiles.documento_identidad', contractorDoc);
+
+        const contractIds = (userContracts || []).map((c: any) => c.id).filter(Boolean);
+        if (contractIds.length > 0) {
+          const { data: duplicates } = await supabase
+            .from('informes_mensuales')
+            .select('id')
+            .in('contrato_id', contractIds)
+            .eq('informe_nro', parseInt(informeNro, 10) || 1);
+
+          if (duplicates && duplicates.length > 0) {
+            for (const dup of duplicates) {
+              await purgeInformeTables(dup.id);
+            }
+          }
+        }
+
+        // Limpiar registros sueltos o vinculados por documento y número de pago/informe
+        await supabase.from('certificaciones_supervision').delete().eq('contratista_documento', contractorDoc).eq('informe_nro', informeNro);
+        await supabase.from('soportes_fiduciaria').delete().eq('contratista_documento', contractorDoc).eq('pago_nro', informeNro);
+        await supabase.from('declaraciones_renta').delete().eq('contratista_documento', contractorDoc).eq('pago_nro', informeNro);
+        await supabase.from('autorizaciones_desembolso').delete().eq('contratista_documento', contractorDoc).eq('pago_nro', informeNro);
+        
+        // Limpiar notificaciones de contratista y supervisión vinculadas a este informe
+        await supabase.from('notificaciones').delete().eq('user_id', contractorDoc).eq('informe_nro', informeNro);
+        await supabase.from('notificaciones').delete().eq('user_id', 'supervisor').eq('informe_nro', informeNro);
+
+        // Limpiar completamente las memorias y cachés de LocalStorage para este contratista e informe
+        if (typeof localStorage !== 'undefined') {
+          const cleanDoc = contractorDoc.replace(/[^0-9]/g, '');
+          
+          // Escanear y remover cualquier llave en localStorage que pertenezca a este número de informe y documento
+          const keysToRemove: string[] = [];
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key) {
+              const lowerKey = key.toLowerCase();
+              const isTargetReportKey = key.endsWith(`_${informeNro}`) || lowerKey.includes(`_${informeNro}_`) || lowerKey.includes(`_${informeNro}`);
+              const containsContractor = lowerKey.includes(contractorDoc.toLowerCase()) || (cleanDoc && lowerKey.includes(cleanDoc.toLowerCase()));
+              
+              if (isTargetReportKey && containsContractor) {
+                keysToRemove.push(key);
+              }
+            }
+          }
+          keysToRemove.forEach(k => localStorage.removeItem(k));
+
+          const keysToDelete = [
+            `alcaldia_quibdo_report_${contractorDoc}_${informeNro}`,
+            `alcaldia_quibdo_report_${cleanDoc}_${informeNro}`,
+            `alcaldia_quibdo_report_${informeNro}`,
+            `informe_data_${contractorDoc}_${informeNro}`,
+            `informe_data_${cleanDoc}_${informeNro}`,
+            `informe_data_${informeNro}`,
+            `cert_data_${contractorDoc}_${informeNro}`,
+            `cert_data_${cleanDoc}_${informeNro}`,
+            `cert_data_${informeNro}`,
+            `fid_data_${contractorDoc}_${informeNro}`,
+            `fid_data_${cleanDoc}_${informeNro}`,
+            `fid_data_${informeNro}`,
+            `dec_renta_${contractorDoc}_${informeNro}`,
+            `dec_renta_${cleanDoc}_${informeNro}`,
+            `desembolso_${contractorDoc}_${informeNro}`,
+            `desembolso_${cleanDoc}_${informeNro}`,
+            `desembolso_${informeNro}`,
+            `notified_approved_${contractorDoc}_${informeNro}`,
+            `notified_approved_${cleanDoc}_${informeNro}`,
+            `informe_comments_${contractorDoc}_${informeNro}`,
+            `informe_comments_${cleanDoc}_${informeNro}`,
+            `informe_comentarios_${contractorDoc}_${informeNro}`,
+            `informe_comentarios_${cleanDoc}_${informeNro}`
+          ];
+
+          if (reportId) {
+            keysToDelete.push(
+              `alcaldia_quibdo_report_${reportId}_${informeNro}`,
+              `cert_data_${reportId}_${informeNro}`,
+              `fid_data_${reportId}_${informeNro}`,
+              `desembolso_${reportId}_${informeNro}`
+            );
+          }
+
+          keysToDelete.forEach(k => localStorage.removeItem(k));
+
+          // Limpiar de localStorage las notificaciones de este informe para contratista y supervisor
+          const notifKeys = [`notificaciones_${contractorDoc}`, `notificaciones_${cleanDoc}`, 'notificaciones_supervisor'];
+          notifKeys.forEach(k => {
+            const saved = localStorage.getItem(k);
+            if (saved) {
+              try {
+                const list: Notificacion[] = JSON.parse(saved);
+                const filtered = list.filter(n => n.informe_nro !== informeNro && (!reportId || n.report_id !== reportId));
+                localStorage.setItem(k, JSON.stringify(filtered));
+              } catch (e) {}
+            }
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Error deleting report from Supabase:', err);
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+    }
+
+    return true;
+  },
+
+  // 11. Actualizar Estado de Informe
+  async updateEstado(id: string, nuevoEstado: EstadoInforme, contractorDoc?: string, informeNro?: string): Promise<boolean> {
+    try {
+      if (isUuid(id)) {
+        const { error } = await supabase
+          .from('notificaciones')
+          .update({ leida: true })
+          .eq('report_id', id)
+          .eq('tipo', 'radicado');
+        
+        const { error: updErr } = await supabase
+          .from('informes_mensuales')
+          .update({ estado: mapStatusToDb(nuevoEstado) })
+          .eq('id', id);
+        if (updErr) throw updErr;
+      }
+
+      // Marcar como leídas las de radicado
+      await this.marcarNotificacionesRadicadasComoLeidas(informeNro, id);
+
+      if (contractorDoc && nuevoEstado === 'Aprobado') {
+        const nro = informeNro || '1';
+        // Marcar observaciones previas como resueltas
+        await this.marcarNotificacionesInformeResueltas(contractorDoc, nro, id);
+
+        this.crearNotificacion({
+          user_id: contractorDoc,
+          titulo: `¡Informe #${nro} Aprobado!`,
+          mensaje: `Tu Informe Contractual #${nro} ha sido revisado y APROBADO formalmente por la supervisión. Ya puedes descargar el PDF oficial.`,
+          tipo: 'aprobacion',
+          leida: false,
+          informe_nro: nro,
+          report_id: isUuid(id) ? id : undefined
+        }).catch(err => console.warn('Error creating approval notification:', err));
+      }
+      return true;
+    } catch (err) {
+      console.warn('Error updating status in Supabase:', err);
+      return true;
+    }
+  },
+
+  // 12. Depuración Automática de Informes, Fotos e Informe Final según la duración real de cada contrato
+  //
+  // El plazo de retención ya NO es un valor fijo para todos los contratistas: se calcula a partir de la
+  // duración real del contrato (fecha_inicio a fecha_terminacion, registrada desde el primer informe /
+  // tabla 'contratos') más 15 días de gracia. Así, un contrato de 3 meses se depura ~3 meses + 15 días
+  // después de vencer, y uno de 6 meses ~6 meses + 15 días, en vez de aplicar 7 meses parejo a todos.
+  // El Informe Final, al entregarse antes de finalizar el contrato, se depura bajo esta misma política.
+  async cleanupExpiredReports(reports: ReportData[], contractorDoc?: string): Promise<{ cleanedCount: number; validReports: ReportData[] }> {
+    const FALLBACK_RETENTION_DAYS = 210; // Respaldo (7 meses) solo si no se logra determinar la duración real del contrato
+    const GRACE_DAYS = 15;
+    const now = new Date();
+
+    const parseDate = (dStr?: string): Date | null => {
+      if (!dStr || dStr === 'N/A') return null;
+      if (dStr.includes('/')) {
+        const parts = dStr.split('/');
+        if (parts.length === 3) {
+          const d = new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
+          return isNaN(d.getTime()) ? null : d;
+        }
+      }
+      if (dStr.includes('-')) {
+        const parts = dStr.split('-');
+        if (parts.length === 3) {
+          const d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+          return isNaN(d.getTime()) ? null : d;
+        }
+      }
+      const d = new Date(dStr);
+      return isNaN(d.getTime()) ? null : d;
+    };
+
+    const contratoDurationDays = (inicio?: string, fin?: string): number | null => {
+      const dInicio = parseDate(inicio);
+      const dFin = parseDate(fin);
+      if (!dInicio || !dFin || dFin <= dInicio) return null;
+      return Math.round((dFin.getTime() - dInicio.getTime()) / (1000 * 60 * 60 * 24));
+    };
+
+    // Determinar el plazo de retención real de este contrato: 1) tabla 'contratos' (fuente autoritativa),
+    // 2) fechas del propio informe como respaldo, 3) valor fijo de 210 días como último recurso.
+    const resolveRetentionDays = async (): Promise<number> => {
+      if (contractorDoc) {
+        try {
+          const contrato = await this.getContratoDeContratista(undefined, contractorDoc);
+          const dias = contratoDurationDays(contrato?.fechaInicio, contrato?.fechaTerminacion);
+          if (dias) return dias + GRACE_DAYS;
+        } catch (e) {
+          console.warn('No se pudo calcular la duración del contrato en tabla contratos:', e);
+        }
+      }
+      for (const rep of reports) {
+        const dias = contratoDurationDays(rep.fechaInicio, rep.fechaTerminacion);
+        if (dias) return dias + GRACE_DAYS;
+      }
+      return FALLBACK_RETENTION_DAYS;
+    };
+
+    const retentionDays = await resolveRetentionDays();
+
+    const validReports: ReportData[] = [];
+    let cleanedCount = 0;
+
+    for (const rep of reports) {
+      // NUNCA eliminar informes en Borrador, Enviados, En Revisión o Rechazados
+      // La política de retención aplica ÚNICAMENTE a informes históricos que ya fueron totalmente 'Aprobados'
+      if (rep.estado !== 'Aprobado') {
+        validReports.push(rep);
+        continue;
+      }
+
+      const targetDate = parseDate(rep.fechaPresentacion) || parseDate(rep.periodoHasta);
+      let isExpired = false;
+
+      if (targetDate) {
+        const diffMs = now.getTime() - targetDate.getTime();
+        const diffDays = diffMs / (1000 * 60 * 60 * 24);
+        if (diffDays > retentionDays) {
+          isExpired = true;
+        }
+      }
+
+      if (isExpired) {
+        cleanedCount++;
+        // Eliminar de Supabase (informes, fotos y obligaciones)
+        await this.deleteFullInforme(rep.id, rep.informeNro, contractorDoc || rep.contratistaDocumento);
+      } else {
+        validReports.push(rep);
+      }
+    }
+
+    // El Informe Final se radica antes de finalizar el contrato y debe depurarse bajo la misma política de retención
+    if (contractorDoc) {
+      try {
+        const informeFinal = await this.getInformeFinal(contractorDoc);
+        if (informeFinal) {
+          const targetDate = parseDate(informeFinal.fechaPresentacion) || parseDate(informeFinal.updatedAt);
+          if (targetDate) {
+            const diffDays = (now.getTime() - targetDate.getTime()) / (1000 * 60 * 60 * 24);
+            if (diffDays > retentionDays) {
+              await this.deleteInformeFinal(contractorDoc, informeFinal.contratoNro);
+              cleanedCount++;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('No se pudo depurar el Informe Final vencido:', e);
+      }
+    }
+
+    return { cleanedCount, validReports };
+  },
+
+  // 12b. Throttle del barrido de depuración: evita repetirlo antes de RETENTION_SWEEP_MIN_INTERVAL_MS
+  // (1 hora) para un mismo 'key' (ej. una secretaría o "global" para Super Admin). Sin esto, cada
+  // remontaje del componente (recarga de HMR incluida) dispararía de nuevo el barrido completo.
+  shouldRunRetentionSweep(key: string): boolean {
+    if (typeof localStorage === 'undefined') return true;
+    try {
+      const raw = localStorage.getItem(`retention_sweep_last_run_${key}`);
+      if (!raw) return true;
+      const last = parseInt(raw, 10);
+      return isNaN(last) || Date.now() - last > RETENTION_SWEEP_MIN_INTERVAL_MS;
+    } catch (e) {
+      return true;
+    }
+  },
+
+  markRetentionSweepRun(key: string): void {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(`retention_sweep_last_run_${key}`, String(Date.now()));
+    } catch (e) {}
+  },
+
+  // 12c. Ejecuta la depuración automática (informes + Informe Final vencidos) para un conjunto de
+  // contratistas agrupando por documento. Pensado para dispararse también desde los paneles de
+  // administración (Secretaría / Super Admin), para que la depuración no dependa únicamente de que el
+  // propio contratista vuelva a entrar a su panel.
+  async sweepExpiredReportsForSecretaria(informes: InformeSummary[], contractorDocs: string[]): Promise<void> {
+    const porDocumento = new Map<string, ReportData[]>();
+
+    for (const inf of informes) {
+      const doc = inf.contratista_documento;
+      if (!doc) continue;
+      if (!porDocumento.has(doc)) porDocumento.set(doc, []);
+      porDocumento.get(doc)!.push({
+        id: inf.id,
+        informeNro: String(inf.informe_nro),
+        estado: inf.estado,
+        fechaPresentacion: inf.fecha_presentacion,
+        periodoHasta: inf.periodo_hasta,
+        contratistaDocumento: inf.contratista_documento,
+      } as unknown as ReportData);
+    }
+
+    // Incluir también contratistas sin informes mensuales restantes: pueden tener un Informe Final huérfano
+    for (const doc of contractorDocs) {
+      if (doc && !porDocumento.has(doc)) porDocumento.set(doc, []);
+    }
+
+    await Promise.all(
+      Array.from(porDocumento.entries()).map(([doc, list]) => this.cleanupExpiredReports(list, doc))
+    );
+  },
+
+  // 13. Guardar / Sincronizar Certificado de Supervisión en Supabase y LocalStorage
+  async saveCertificadoSupervision(
+    certData: CertificadoSupervisionData, 
+    informeId?: string,
+    supervisorId?: string,
+    contratoIdParam?: string,
+    options?: { excludeLiquidacion?: boolean }
+  ): Promise<{ success: boolean; id?: string; error?: string }> {
+    const docKey = certData.contratistaDocumento || '';
+    const cleanDoc = docKey.replace(/[^0-9]/g, '');
+    const pagoNroStr = String(certData.pagoNro || '1');
+    let mergedCertData = sanitizeCertificadoData({ ...certData });
+
+    // 1. Guardar copia en LocalStorage inmediatamente con todas las variantes de clave
+    if (typeof localStorage !== 'undefined') {
+      const storageKey = `cert_data_${docKey}_${pagoNroStr}`;
+      
+      // Si excludeLiquidacion es true, verificar si ya había datos de liquidación y datos personalizados en localStorage
+      if (options?.excludeLiquidacion) {
+        const prevRaw = localStorage.getItem(storageKey) || 
+                        (cleanDoc ? localStorage.getItem(`cert_data_${cleanDoc}_${pagoNroStr}`) : null) ||
+                        (informeId ? localStorage.getItem(`cert_data_${informeId}_${pagoNroStr}`) : null) ||
+                        localStorage.getItem(`cert_data_${pagoNroStr}`);
+        if (prevRaw) {
+          try {
+            const prevObj = JSON.parse(prevRaw);
+            mergedCertData = {
+              ...certData,
+              ...prevObj,
+              contratistaNombre: certData.contratistaNombre || prevObj.contratistaNombre,
+              contratistaDocumento: certData.contratistaDocumento || prevObj.contratistaDocumento,
+              supervisorNombre: certData.supervisorNombre || prevObj.supervisorNombre,
+              objeto: certData.objeto || prevObj.objeto,
+              pagoNro: pagoNroStr,
+              numeroCuenta: certData.numeroCuenta || prevObj.numeroCuenta || '',
+              banco: certData.banco || prevObj.banco || '',
+              tipoCuenta: certData.tipoCuenta || prevObj.tipoCuenta || 'AHORRO',
+              fechaRegistroPresupuestal: certData.fechaRegistroPresupuestal || prevObj.fechaRegistroPresupuestal || '',
+              codigoRubro: certData.codigoRubro || prevObj.codigoRubro || '',
+              fechaRegistroPresupuestal2: certData.fechaRegistroPresupuestal2 ?? prevObj.fechaRegistroPresupuestal2,
+              codigoRubro2: certData.codigoRubro2 ?? prevObj.codigoRubro2,
+              fechaRegistroPresupuestal3: certData.fechaRegistroPresupuestal3 ?? prevObj.fechaRegistroPresupuestal3,
+              codigoRubro3: certData.codigoRubro3 ?? prevObj.codigoRubro3,
+              fechaRegistroPresupuestal4: certData.fechaRegistroPresupuestal4 ?? prevObj.fechaRegistroPresupuestal4,
+              codigoRubro4: certData.codigoRubro4 ?? prevObj.codigoRubro4,
+              fechaRegistroPresupuestal5: certData.fechaRegistroPresupuestal5 ?? prevObj.fechaRegistroPresupuestal5,
+              codigoRubro5: certData.codigoRubro5 ?? prevObj.codigoRubro5,
+              cdpNro: certData.cdpNro || prevObj.cdpNro || '',
+              cdpNro2: certData.cdpNro2 ?? prevObj.cdpNro2,
+              cdpNro3: certData.cdpNro3 ?? prevObj.cdpNro3,
+              cdpNro4: certData.cdpNro4 ?? prevObj.cdpNro4,
+              cdpNro5: certData.cdpNro5 ?? prevObj.cdpNro5,
+              crpNro: certData.crpNro || prevObj.crpNro || '',
+              crpNro2: certData.crpNro2 ?? prevObj.crpNro2,
+              crpNro3: certData.crpNro3 ?? prevObj.crpNro3,
+              crpNro4: certData.crpNro4 ?? prevObj.crpNro4,
+              crpNro5: certData.crpNro5 ?? prevObj.crpNro5,
+              valorRubro: certData.valorRubro || prevObj.valorRubro,
+              valorRubro2: certData.valorRubro2 ?? prevObj.valorRubro2,
+              valorRubro3: certData.valorRubro3 ?? prevObj.valorRubro3,
+              valorRubro4: certData.valorRubro4 ?? prevObj.valorRubro4,
+              valorRubro5: certData.valorRubro5 ?? prevObj.valorRubro5,
+              saludValor: certData.saludValor || prevObj.saludValor,
+              saludEps: certData.saludEps || prevObj.saludEps,
+              saludPlanilla: certData.saludPlanilla || prevObj.saludPlanilla,
+              pensionValor: certData.pensionValor || prevObj.pensionValor,
+              pensionFondo: certData.pensionFondo || prevObj.pensionFondo,
+              pensionPlanilla: certData.pensionPlanilla || prevObj.pensionPlanilla,
+              arpValor: certData.arpValor || prevObj.arpValor,
+              arpAseguradora: certData.arpAseguradora || prevObj.arpAseguradora,
+              arpPlanilla: certData.arpPlanilla || prevObj.arpPlanilla,
+              expedicionDia: certData.expedicionDia || prevObj.expedicionDia,
+              expedicionMes: certData.expedicionMes || prevObj.expedicionMes,
+              expedicionAno: certData.expedicionAno || prevObj.expedicionAno,
+              valorAvalado: prevObj.valorAvalado || certData.valorAvalado,
+              saldoPorPagar: prevObj.saldoPorPagar || certData.saldoPorPagar,
+              porcentajeEjecucion: prevObj.porcentajeEjecucion || certData.porcentajeEjecucion,
+              valorPagadoAcumulado: prevObj.valorPagadoAcumulado || certData.valorPagadoAcumulado,
+            };
+          } catch (e) {}
+        }
+      }
+
+      mergedCertData = sanitizeCertificadoData(mergedCertData);
+      localStorage.setItem(storageKey, JSON.stringify(mergedCertData));
+      if (cleanDoc) {
+        localStorage.setItem(`cert_data_${cleanDoc}_${pagoNroStr}`, JSON.stringify(mergedCertData));
+      }
+      localStorage.setItem(`cert_data_${pagoNroStr}`, JSON.stringify(mergedCertData));
+      if (informeId) {
+        localStorage.setItem(`cert_data_${informeId}_${pagoNroStr}`, JSON.stringify(mergedCertData));
+      }
+    }
+
+    try {
+      let resolvedInformeId = (informeId && isUuid(informeId)) ? informeId : null;
+      let contratoId: string | null = (contratoIdParam && isUuid(contratoIdParam)) ? contratoIdParam : null;
+
+      // Si tenemos informeId pero no contratoId, consultar contrato_id desde informes_mensuales
+      if (resolvedInformeId && !contratoId) {
+        const { data: rep } = await supabase
+          .from('informes_mensuales')
+          .select('contrato_id')
+          .eq('id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (rep?.contrato_id && isUuid(rep.contrato_id)) {
+          contratoId = rep.contrato_id;
+        }
+      }
+
+      // Si no tenemos UUID de informe, buscar si existe informe por documento y número de pago
+      if (!resolvedInformeId && (docKey || cleanDoc)) {
+        const { data: rep } = await supabase
+          .from('informes_mensuales')
+          .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
+          .eq('informe_nro', parseInt(pagoNroStr, 10) || 1)
+          .or(`contratos.profiles.documento_identidad.eq.${docKey},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+          .limit(1)
+          .maybeSingle();
+
+        if (rep?.id && isUuid(rep.id)) {
+          resolvedInformeId = rep.id;
+          if (!contratoId && (rep as any).contrato_id) {
+            contratoId = (rep as any).contrato_id;
+          }
+        }
+      }
+
+      // Comprobar si ya existe registro por informe_id o por documento y pago_nro
+      let existingId: string | null = null;
+      let existingDbForm: any = null;
+      if (resolvedInformeId) {
+        const { data: existingCert } = await supabase
+          .from('certificaciones_supervision')
+          .select('id, datos_formulario')
+          .eq('informe_id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (existingCert?.id) {
+          existingId = existingCert.id;
+          existingDbForm = existingCert.datos_formulario;
+        }
+      }
+
+      if (!existingId && (docKey || cleanDoc)) {
+        const { data: existingByDoc } = await supabase
+          .from('certificaciones_supervision')
+          .select('id, datos_formulario')
+          .or(`contratista_documento.eq.${docKey},contratista_documento.eq.${cleanDoc}`)
+          .eq('pago_nro', pagoNroStr)
+          .limit(1)
+          .maybeSingle();
+        if (existingByDoc?.id) {
+          existingId = existingByDoc.id;
+          existingDbForm = existingByDoc.datos_formulario;
+        }
+      }
+
+      // Si se excluye liquidación y ya existían datos en la base de datos, preservar los valores personalizados
+      if (options?.excludeLiquidacion && existingDbForm) {
+        mergedCertData = {
+          ...mergedCertData,
+          numeroCuenta: mergedCertData.numeroCuenta || existingDbForm.numeroCuenta || '',
+          banco: mergedCertData.banco || existingDbForm.banco || '',
+          tipoCuenta: mergedCertData.tipoCuenta || existingDbForm.tipoCuenta || 'AHORRO',
+          fechaRegistroPresupuestal: mergedCertData.fechaRegistroPresupuestal || existingDbForm.fechaRegistroPresupuestal || '',
+          codigoRubro: mergedCertData.codigoRubro || existingDbForm.codigoRubro || '',
+          fechaRegistroPresupuestal2: mergedCertData.fechaRegistroPresupuestal2 ?? existingDbForm.fechaRegistroPresupuestal2,
+          codigoRubro2: mergedCertData.codigoRubro2 ?? existingDbForm.codigoRubro2,
+          fechaRegistroPresupuestal3: mergedCertData.fechaRegistroPresupuestal3 ?? existingDbForm.fechaRegistroPresupuestal3,
+          codigoRubro3: mergedCertData.codigoRubro3 ?? existingDbForm.codigoRubro3,
+          fechaRegistroPresupuestal4: mergedCertData.fechaRegistroPresupuestal4 ?? existingDbForm.fechaRegistroPresupuestal4,
+          codigoRubro4: mergedCertData.codigoRubro4 ?? existingDbForm.codigoRubro4,
+          fechaRegistroPresupuestal5: mergedCertData.fechaRegistroPresupuestal5 ?? existingDbForm.fechaRegistroPresupuestal5,
+          codigoRubro5: mergedCertData.codigoRubro5 ?? existingDbForm.codigoRubro5,
+          cdpNro: mergedCertData.cdpNro || existingDbForm.cdpNro || '',
+          cdpNro2: mergedCertData.cdpNro2 ?? existingDbForm.cdpNro2,
+          cdpNro3: mergedCertData.cdpNro3 ?? existingDbForm.cdpNro3,
+          cdpNro4: mergedCertData.cdpNro4 ?? existingDbForm.cdpNro4,
+          cdpNro5: mergedCertData.cdpNro5 ?? existingDbForm.cdpNro5,
+          crpNro: mergedCertData.crpNro || existingDbForm.crpNro || '',
+          crpNro2: mergedCertData.crpNro2 ?? existingDbForm.crpNro2,
+          crpNro3: mergedCertData.crpNro3 ?? existingDbForm.crpNro3,
+          crpNro4: mergedCertData.crpNro4 ?? existingDbForm.crpNro4,
+          crpNro5: mergedCertData.crpNro5 ?? existingDbForm.crpNro5,
+          valorRubro: mergedCertData.valorRubro || existingDbForm.valorRubro,
+          valorRubro2: existingDbForm.valorRubro2 ?? mergedCertData.valorRubro2,
+          valorRubro3: existingDbForm.valorRubro3 ?? mergedCertData.valorRubro3,
+          valorRubro4: existingDbForm.valorRubro4 ?? mergedCertData.valorRubro4,
+          valorRubro5: existingDbForm.valorRubro5 ?? mergedCertData.valorRubro5,
+          saludValor: mergedCertData.saludValor || existingDbForm.saludValor,
+          saludEps: mergedCertData.saludEps || existingDbForm.saludEps,
+          saludPlanilla: mergedCertData.saludPlanilla || existingDbForm.saludPlanilla,
+          pensionValor: mergedCertData.pensionValor || existingDbForm.pensionValor,
+          pensionFondo: mergedCertData.pensionFondo || existingDbForm.pensionFondo,
+          pensionPlanilla: mergedCertData.pensionPlanilla || existingDbForm.pensionPlanilla,
+          arpValor: mergedCertData.arpValor || existingDbForm.arpValor,
+          arpAseguradora: mergedCertData.arpAseguradora || existingDbForm.arpAseguradora,
+          arpPlanilla: mergedCertData.arpPlanilla || existingDbForm.arpPlanilla,
+          expedicionDia: existingDbForm.expedicionDia || mergedCertData.expedicionDia,
+          expedicionMes: existingDbForm.expedicionMes || mergedCertData.expedicionMes,
+          expedicionAno: existingDbForm.expedicionAno || mergedCertData.expedicionAno,
+          valorAvalado: existingDbForm.valorAvalado || mergedCertData.valorAvalado,
+          saldoPorPagar: existingDbForm.saldoPorPagar || mergedCertData.saldoPorPagar,
+          porcentajeEjecucion: existingDbForm.porcentajeEjecucion || mergedCertData.porcentajeEjecucion,
+          valorPagadoAcumulado: existingDbForm.valorPagadoAcumulado || mergedCertData.valorPagadoAcumulado,
+        };
+
+        mergedCertData = sanitizeCertificadoData(mergedCertData);
+
+        if (typeof localStorage !== 'undefined') {
+          const storageKey = `cert_data_${docKey}_${pagoNroStr}`;
+          localStorage.setItem(storageKey, JSON.stringify(mergedCertData));
+          if (cleanDoc) localStorage.setItem(`cert_data_${cleanDoc}_${pagoNroStr}`, JSON.stringify(mergedCertData));
+          localStorage.setItem(`cert_data_${pagoNroStr}`, JSON.stringify(mergedCertData));
+          if (informeId) localStorage.setItem(`cert_data_${informeId}_${pagoNroStr}`, JSON.stringify(mergedCertData));
+        }
+      }
+
+      const numTotalAPagar = limpiarNumeroMoneda(mergedCertData.valorTotalAPagar || mergedCertData.valorAPagarSinIva || mergedCertData.valorAvalado);
+      const numTotalContrato = limpiarNumeroMoneda(mergedCertData.valorTotal || mergedCertData.valorInicial);
+      const numSaldoPorPagar = limpiarNumeroMoneda(mergedCertData.saldoPorPagar);
+
+      const payload: any = {
+        contratista_documento: cleanDoc || docKey,
+        pago_nro: pagoNroStr,
+        periodo_certificado: `${mergedCertData.periodoDesde || ''} - ${mergedCertData.periodoHasta || ''}`,
+        valor_autorizado_pago: numTotalAPagar,
+        valor_total_contrato: numTotalContrato,
+        observaciones_supervision: mergedCertData.objeto || '',
+        observaciones_liquidacion: mergedCertData.observacionesLiquidacion || '',
+        expedicion_dia: mergedCertData.expedicionDia || '',
+        expedicion_mes: mergedCertData.expedicionMes || '',
+        expedicion_ano: mergedCertData.expedicionAno || '',
+        datos_formulario: mergedCertData, // Guardar todos los campos íntegramente
+        certifica_cumplimiento: true,
+        updated_at: new Date().toISOString(),
+      };
+
+      // Si no se solicita excluir liquidación (o si es guardado directo desde el certificado/calculadora), enviar saldo_por_pagar y porcentaje_ejecucion
+      if (!options?.excludeLiquidacion) {
+        payload.saldo_por_pagar = numSaldoPorPagar;
+        payload.porcentaje_ejecucion = mergedCertData.porcentajeEjecucion || '';
+      }
+
+      if (resolvedInformeId && isUuid(resolvedInformeId)) {
+        payload.informe_id = resolvedInformeId;
+      }
+      if (contratoId && isUuid(contratoId)) {
+        payload.contrato_id = contratoId;
+      }
+      if (supervisorId && isUuid(supervisorId)) {
+        payload.supervisor_id = supervisorId;
+      }
+
+      if (existingId) {
+        const { error: updateErr } = await supabase
+          .from('certificaciones_supervision')
+          .update(payload)
+          .eq('id', existingId);
+
+        if (updateErr) console.warn('Supabase update cert error:', updateErr);
+        return { success: true, id: existingId };
+      } else {
+        const { data: inserted, error: insertErr } = await supabase
+          .from('certificaciones_supervision')
+          .insert([payload])
+          .select('id')
+          .maybeSingle();
+
+        if (insertErr) console.warn('Supabase insert cert error:', insertErr);
+        return { success: true, id: inserted?.id };
+      }
+    } catch (e: any) {
+      console.warn('Error saving certificado supervision to Supabase:', e);
+      return { success: true, id: `local-${Date.now()}` };
+    }
+  },
+
+  // 14. Obtener Certificado de Supervisión desde Supabase o LocalStorage
+  async getCertificadoSupervision(
+    informeId?: string,
+    docIdentidad?: string,
+    pagoNro?: string
+  ): Promise<CertificadoSupervisionData | null> {
+    try {
+      if (informeId && isUuid(informeId)) {
+        const { data, error } = await supabase
+          .from('certificaciones_supervision')
+          .select('*')
+          .eq('informe_id', informeId)
+          .limit(1)
+          .maybeSingle();
+
+        if (!error && data) {
+          const form = data.datos_formulario ? (data.datos_formulario as CertificadoSupervisionData) : null;
+          if (form) {
+            const sanitized = sanitizeCertificadoData(form);
+            if (JSON.stringify(form) !== JSON.stringify(sanitized)) {
+              supabase
+                .from('certificaciones_supervision')
+                .update({ datos_formulario: sanitized })
+                .eq('id', data.id)
+                .then();
+            }
+            return sanitized;
+          }
+        }
+      }
+
+      const cleanDoc = (docIdentidad || '').replace(/[^0-9]/g, '');
+      if (docIdentidad && pagoNro) {
+        const { data, error } = await supabase
+          .from('certificaciones_supervision')
+          .select('*')
+          .or(`contratista_documento.eq.${docIdentidad},contratista_documento.eq.${cleanDoc}`)
+          .eq('pago_nro', String(pagoNro))
+          .limit(1)
+          .maybeSingle();
+
+        if (!error && data) {
+          const form = data.datos_formulario ? (data.datos_formulario as CertificadoSupervisionData) : null;
+          if (form) {
+            const sanitized = sanitizeCertificadoData(form);
+            if (JSON.stringify(form) !== JSON.stringify(sanitized)) {
+              supabase
+                .from('certificaciones_supervision')
+                .update({ datos_formulario: sanitized })
+                .eq('id', data.id)
+                .then();
+            }
+            return sanitized;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Error fetching certificado supervision:', e);
+    }
+
+    // Fallback a LocalStorage
+    if (typeof localStorage !== 'undefined') {
+      const cleanDoc = (docIdentidad || '').replace(/[^0-9]/g, '');
+      const key = `cert_data_${docIdentidad || ''}_${pagoNro || '1'}`;
+      const saved = localStorage.getItem(key) || 
+        (cleanDoc ? localStorage.getItem(`cert_data_${cleanDoc}_${pagoNro || '1'}`) : null) ||
+        (informeId && pagoNro ? localStorage.getItem(`cert_data_${informeId}_${pagoNro}`) : null) ||
+        (pagoNro ? localStorage.getItem(`cert_data_${pagoNro}`) : null);
+      if (saved) {
+        try {
+          return sanitizeCertificadoData(JSON.parse(saved));
+        } catch (e) {}
+      }
+    }
+
+    return null;
+  },
+
+  // 14.1. Purga deshabilitada para prevenir sobrescritura de datos reales del usuario
+  async purgeLegacyMockCertificates(): Promise<void> {
+    return Promise.resolve();
+  },
+
+  // 14b. Vaciar / Eliminar registro de Certificado de Supervisión de la tabla certificaciones_supervision y cachés
+  async vaciarCertificadoSupervision(params: {
+    informeId?: string;
+    contratistaDocumento?: string;
+    pagoNro?: string | number;
+    certId?: string;
+  }): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { informeId, contratistaDocumento, pagoNro, certId } = params;
+      const cleanDoc = (contratistaDocumento || '').replace(/[^0-9]/g, '');
+      const pNroStr = pagoNro !== undefined ? String(pagoNro) : '';
+
+      // 1. Eliminar por ID único de registro si se tiene
+      if (certId && isUuid(certId)) {
+        await supabase.from('certificaciones_supervision').delete().eq('id', certId);
+      }
+
+      // 2. Eliminar por informe_id UUID si se tiene
+      if (informeId && isUuid(informeId)) {
+        await supabase.from('certificaciones_supervision').delete().eq('informe_id', informeId);
+      }
+
+      // 3. Eliminar por documento del contratista y número de pago
+      if ((contratistaDocumento || cleanDoc) && pNroStr) {
+        if (cleanDoc) {
+          await supabase
+            .from('certificaciones_supervision')
+            .delete()
+            .eq('contratista_documento', cleanDoc)
+            .eq('pago_nro', pNroStr);
+        }
+        if (contratistaDocumento && contratistaDocumento !== cleanDoc) {
+          await supabase
+            .from('certificaciones_supervision')
+            .delete()
+            .eq('contratista_documento', contratistaDocumento)
+            .eq('pago_nro', pNroStr);
+        }
+      }
+
+      // 4. Limpiar todas las claves de caché y persistencia local para este pago y contratista
+      if (typeof localStorage !== 'undefined') {
+        const keysToRemove = [
+          informeId ? `cert_data_${informeId}_${pNroStr}` : '',
+          contratistaDocumento ? `cert_data_${contratistaDocumento}_${pNroStr}` : '',
+          cleanDoc ? `cert_data_${cleanDoc}_${pNroStr}` : '',
+          pNroStr ? `cert_data_${pNroStr}` : '',
+          informeId ? `cert_data_${informeId}` : '',
+          contratistaDocumento ? `cert_data_${contratistaDocumento}` : '',
+          cleanDoc ? `cert_data_${cleanDoc}` : '',
+          'cert_data_global',
+        ].filter(Boolean);
+
+        keysToRemove.forEach(k => {
+          try {
+            localStorage.removeItem(k);
+          } catch (e) {}
+        });
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      console.error('Error al vaciar certificado_supervision en Supabase:', err);
+      return { success: false, error: err?.message || 'Error al eliminar registro de la tabla' };
+    }
+  },
+
+  // 15. Guardar Soporte Fiduciaria
+  async saveSoporteFiduciaria(
+    informeId: string,
+    data: any,
+    docKey?: string,
+    pagoNroStr?: string,
+    contratoIdStr?: string
+  ): Promise<{ success: boolean; id?: string }> {
+    try {
+      const docKeyToUse = docKey || data?.cedula || data?.nitCc || data?.contratistaDocumento || '';
+      const cleanDoc = docKeyToUse ? docKeyToUse.replace(/[^0-9]/g, '') : '';
+      const nroStr = pagoNroStr || String(data?.pagoNro || data?.consecutivoNro || '1');
+
+      // 1. Guardar copia en LocalStorage inmediatamente
+      if (typeof localStorage !== 'undefined' && data) {
+        if (docKeyToUse) {
+          localStorage.setItem(`fid_data_${docKeyToUse}_${nroStr}`, JSON.stringify(data));
+        }
+        if (cleanDoc) {
+          localStorage.setItem(`fid_data_${cleanDoc}_${nroStr}`, JSON.stringify(data));
+        }
+        localStorage.setItem(`fid_data_${nroStr}`, JSON.stringify(data));
+        if (informeId) {
+          localStorage.setItem(`fid_data_${informeId}_${nroStr}`, JSON.stringify(data));
+        }
+      }
+
+      let resolvedInformeId = (informeId && isUuid(informeId)) ? informeId : '';
+      let contratoId: string | null = (contratoIdStr && isUuid(contratoIdStr)) ? contratoIdStr : null;
+
+      if (!resolvedInformeId && (docKeyToUse || cleanDoc)) {
+        const { data: rep } = await supabase
+          .from('informes_mensuales')
+          .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
+          .eq('informe_nro', parseInt(nroStr, 10) || 1)
+          .or(`contratos.profiles.documento_identidad.eq.${docKeyToUse},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+          .limit(1)
+          .maybeSingle();
+
+        if (rep?.id && isUuid(rep.id)) {
+          resolvedInformeId = rep.id;
+          if (!contratoId && (rep as any).contrato_id) {
+            contratoId = (rep as any).contrato_id;
+          }
+        }
+      }
+
+      if (resolvedInformeId && !contratoId) {
+        const { data: rep } = await supabase
+          .from('informes_mensuales')
+          .select('contrato_id')
+          .eq('id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (rep?.contrato_id && isUuid(rep.contrato_id)) {
+          contratoId = rep.contrato_id;
+        }
+      }
+
+      if (typeof data === 'object' && data !== null) {
+        if (resolvedInformeId) data.reportId = resolvedInformeId;
+        if (contratoId) data.contratoId = contratoId;
+      }
+
+      const payload: any = {
+        contratista_documento: cleanDoc || docKeyToUse,
+        pago_nro: nroStr,
+        datos_formulario: data,
+        fecha_actualizacion: new Date().toISOString()
+      };
+
+      if (resolvedInformeId && isUuid(resolvedInformeId)) {
+        payload.informe_id = resolvedInformeId;
+      }
+      if (contratoId && isUuid(contratoId)) {
+        payload.contrato_id = contratoId;
+      }
+
+      let existingId: string | null = null;
+      if (resolvedInformeId) {
+        const { data: existingFid } = await supabase
+          .from('soportes_fiduciaria')
+          .select('id')
+          .eq('informe_id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (existingFid?.id) existingId = existingFid.id;
+      }
+
+      if (!existingId && (docKeyToUse || cleanDoc)) {
+        const { data: existingByDoc } = await supabase
+          .from('soportes_fiduciaria')
+          .select('id')
+          .or(`contratista_documento.eq.${docKeyToUse},contratista_documento.eq.${cleanDoc}`)
+          .eq('pago_nro', nroStr)
+          .limit(1)
+          .maybeSingle();
+        if (existingByDoc?.id) existingId = existingByDoc.id;
+      }
+
+      if (contratoId) {
+        const contractUpdate: any = {};
+        if (data?.nroCuenta) contractUpdate.numero_cuenta = data.nroCuenta;
+        if (data?.banco) contractUpdate.banco = data.banco;
+        if (data?.tipoCuenta) contractUpdate.tipo_cuenta = data.tipoCuenta;
+        if (data?.ciudad) contractUpdate.ciudad = data.ciudad;
+        if (Object.keys(contractUpdate).length > 0) {
+          await supabase.from('contratos').update(contractUpdate).eq('id', contratoId);
+        }
+      }
+      const dirValFid = data?.direccion;
+      const docValFid = cleanDoc || docKeyToUse;
+      if (dirValFid && docValFid) {
+        await supabase.from('profiles').update({ direccion: dirValFid }).or(`documento_identidad.eq.${docValFid},documento_identidad.eq.${docKeyToUse}`);
+      }
+
+      if (existingId) {
+        const { error: updateErr } = await supabase
+          .from('soportes_fiduciaria')
+          .update(payload)
+          .eq('id', existingId);
+        if (updateErr) {
+          console.warn('Supabase update soportes_fiduciaria error:', updateErr);
+        }
+        return { success: true, id: existingId };
+      } else {
+        const { data: inserted, error: insertErr } = await supabase
+          .from('soportes_fiduciaria')
+          .insert([payload])
+          .select('id')
+          .maybeSingle();
+        if (insertErr) {
+          console.warn('Supabase insert soportes_fiduciaria error:', insertErr);
+        }
+        return { success: true, id: inserted?.id };
+      }
+    } catch (e: any) {
+      console.warn('Error saving soporte fiduciaria to Supabase:', e);
+      return { success: true, id: `local-${Date.now()}` };
+    }
+  },
+
+  // 16. Obtener Soporte Fiduciaria
+  async getSoporteFiduciaria(
+    informeId?: string,
+    docIdentidad?: string,
+    pagoNro?: string
+  ): Promise<any | null> {
+    try {
+      if (informeId && isUuid(informeId)) {
+        const { data, error } = await supabase
+          .from('soportes_fiduciaria')
+          .select('*')
+          .eq('informe_id', informeId)
+          .limit(1)
+          .maybeSingle();
+        if (!error && data?.datos_formulario) return data.datos_formulario;
+      }
+      if (docIdentidad && pagoNro) {
+        const cleanDoc = docIdentidad.replace(/[^0-9]/g, '');
+        const { data, error } = await supabase
+          .from('soportes_fiduciaria')
+          .select('*')
+          .or(`contratista_documento.eq.${docIdentidad},contratista_documento.eq.${cleanDoc}`)
+          .eq('pago_nro', pagoNro)
+          .limit(1)
+          .maybeSingle();
+        if (!error && data?.datos_formulario) return data.datos_formulario;
+      }
+    } catch (e) {
+      console.warn('Error fetching soporte fiduciaria:', e);
+    }
+
+    if (typeof localStorage !== 'undefined') {
+      const cleanDoc = docIdentidad ? docIdentidad.replace(/[^0-9]/g, '') : '';
+      const keysToTry = [
+        `fid_data_${docIdentidad || ''}_${pagoNro || '1'}`,
+        `fid_data_${cleanDoc}_${pagoNro || '1'}`,
+        `fid_data_${informeId || ''}_${pagoNro || '1'}`,
+        `fid_data_${pagoNro || '1'}`
+      ];
+      for (const k of keysToTry) {
+        const saved = localStorage.getItem(k);
+        if (saved) {
+          try { return JSON.parse(saved); } catch (e) {}
+        }
+      }
+    }
+    return null;
+  },
+
+  // 17. Guardar Declaracion Renta
+  async saveDeclaracionRenta(
+    informeId: string,
+    data: any,
+    docKey?: string,
+    pagoNroStr: string = '1',
+    contratoIdStr?: string
+  ): Promise<{ success: boolean; id?: string }> {
+    const cleanDoc = docKey ? docKey.replace(/\D/g, '') : '';
+    
+    // Backup local
+    if (typeof localStorage !== 'undefined') {
+      const keys = [
+        docKey ? `dec_renta_${docKey}_${pagoNroStr}` : null,
+        cleanDoc ? `dec_renta_${cleanDoc}_${pagoNroStr}` : null,
+        informeId ? `dec_renta_${informeId}_${pagoNroStr}` : null
+      ].filter(Boolean) as string[];
+      keys.forEach(k => localStorage.setItem(k, JSON.stringify(data)));
+    }
+
+    try {
+      let resolvedInformeId = (informeId && isUuid(informeId)) ? informeId : '';
+      let contratoId: string | null = (contratoIdStr && isUuid(contratoIdStr)) ? contratoIdStr : null;
+
+      if (!resolvedInformeId && (docKey || cleanDoc)) {
+        try {
+          const { data: rep } = await supabase
+            .from('informes_mensuales')
+            .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
+            .eq('informe_nro', parseInt(pagoNroStr, 10) || 1)
+            .or(`contratos.profiles.documento_identidad.eq.${docKey},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+            .limit(1)
+            .maybeSingle();
+
+          if (rep?.id && isUuid(rep.id)) {
+            resolvedInformeId = rep.id;
+            if (!contratoId && (rep as any).contrato_id) {
+              contratoId = (rep as any).contrato_id;
+            }
+          }
+        } catch (rErr) {}
+      }
+
+      if (resolvedInformeId && !contratoId) {
+        const { data: rep } = await supabase
+          .from('informes_mensuales')
+          .select('contrato_id')
+          .eq('id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (rep?.contrato_id && isUuid(rep.contrato_id)) {
+          contratoId = rep.contrato_id;
+        }
+      }
+
+      const payload: any = {
+        contratista_documento: cleanDoc || docKey,
+        pago_nro: pagoNroStr,
+        datos_formulario: data,
+        fecha_actualizacion: new Date().toISOString()
+      };
+
+      if (resolvedInformeId && isUuid(resolvedInformeId)) payload.informe_id = resolvedInformeId;
+      if (contratoId && isUuid(contratoId)) payload.contrato_id = contratoId;
+
+      let existingId: string | null = null;
+      if (resolvedInformeId && isUuid(resolvedInformeId)) {
+        const { data: existingFid } = await supabase
+          .from('declaraciones_renta')
+          .select('id')
+          .eq('informe_id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (existingFid?.id) existingId = existingFid.id;
+      }
+
+      if (!existingId && (docKey || cleanDoc)) {
+        const { data: existingByDoc } = await supabase
+          .from('declaraciones_renta')
+          .select('id')
+          .or(`contratista_documento.eq.${docKey},contratista_documento.eq.${cleanDoc}`)
+          .eq('pago_nro', pagoNroStr)
+          .limit(1)
+          .maybeSingle();
+        if (existingByDoc?.id) existingId = existingByDoc.id;
+      }
+
+      if (existingId) {
+        const updateRes = await executeSafeUpdate('declaraciones_renta', payload, existingId);
+        if (updateRes.error) {
+          console.warn('Declaracion renta update warning:', updateRes.error.message);
+        }
+        return { success: !updateRes.error, id: existingId };
+      } else {
+        const insertRes = await executeSafeInsert('declaraciones_renta', payload);
+        if (insertRes.error) {
+          console.warn('Declaracion renta insert warning:', insertRes.error.message);
+        }
+        return { success: !insertRes.error, id: insertRes.data?.id };
+      }
+    } catch (e: any) {
+      console.warn('Error saving declaracion renta to Supabase:', e);
+      return { success: true, id: `local-${Date.now()}` };
+    }
+  },
+
+  // 18. Obtener Declaracion Renta
+  async getDeclaracionRenta(
+    informeId?: string,
+    docIdentidad?: string,
+    pagoNro: string = '1'
+  ): Promise<any | null> {
+    const cleanDoc = docIdentidad ? docIdentidad.replace(/\D/g, '') : '';
+
+    try {
+      if (informeId && isUuid(informeId)) {
+        const { data, error } = await supabase
+          .from('declaraciones_renta')
+          .select('*')
+          .eq('informe_id', informeId)
+          .limit(1)
+          .maybeSingle();
+        if (!error && data?.datos_formulario) return data.datos_formulario;
+      }
+
+      if (docIdentidad || cleanDoc) {
+        const filterCond = [
+          docIdentidad ? `contratista_documento.eq.${docIdentidad}` : null,
+          cleanDoc ? `contratista_documento.eq.${cleanDoc}` : null
+        ].filter(Boolean).join(',');
+
+        const { data, error } = await supabase
+          .from('declaraciones_renta')
+          .select('*')
+          .or(filterCond)
+          .eq('pago_nro', pagoNro)
+          .order('id', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (!error && data?.datos_formulario) return data.datos_formulario;
+
+        // Fallback: Buscar la última declaración de este contratista independientemente del pago
+        const { data: latestData } = await supabase
+          .from('declaraciones_renta')
+          .select('*')
+          .or(filterCond)
+          .order('id', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (latestData?.datos_formulario) return latestData.datos_formulario;
+      }
+    } catch (e) {
+      console.warn('Error fetching declaracion renta:', e);
+    }
+
+    if (typeof localStorage !== 'undefined') {
+      const keysToTry = [
+        docIdentidad ? `dec_renta_${docIdentidad}_${pagoNro}` : null,
+        cleanDoc ? `dec_renta_${cleanDoc}_${pagoNro}` : null,
+        informeId ? `dec_renta_${informeId}_${pagoNro}` : null
+      ].filter(Boolean) as string[];
+
+      for (const k of keysToTry) {
+        const saved = localStorage.getItem(k);
+        if (saved) {
+          try { return JSON.parse(saved); } catch (e) {}
+        }
+      }
+    }
+    return null;
+  },
+
+  // 19. Guardar Autorización de Desembolso
+  async saveAutorizacionDesembolso(
+    informeId: string,
+    data: any,
+    docKey?: string,
+    pagoNroStr?: string,
+    contratoIdStr?: string
+  ): Promise<{ success: boolean; id?: string }> {
+    try {
+      const docKeyToUse = docKey || data?.nitCc || data?.contratistaDocumento || '';
+      const cleanDoc = docKeyToUse ? docKeyToUse.replace(/[^0-9]/g, '') : '';
+      const nroStr = pagoNroStr || String(data?.consecutivoNro || data?.pagoNro || '1');
+
+      // 1. Guardar copia en LocalStorage inmediatamente con todas las variantes de clave
+      if (typeof localStorage !== 'undefined' && data) {
+        if (docKeyToUse) {
+          localStorage.setItem(`desembolso_${docKeyToUse}_${nroStr}`, JSON.stringify(data));
+        }
+        if (cleanDoc) {
+          localStorage.setItem(`desembolso_${cleanDoc}_${nroStr}`, JSON.stringify(data));
+        }
+        localStorage.setItem(`desembolso_${nroStr}`, JSON.stringify(data));
+        if (informeId) {
+          localStorage.setItem(`desembolso_${informeId}_${nroStr}`, JSON.stringify(data));
+        }
+      }
+
+      let resolvedInformeId = (informeId && isUuid(informeId)) ? informeId : '';
+      let contratoId: string | null = (contratoIdStr && isUuid(contratoIdStr)) ? contratoIdStr : null;
+
+      // Buscar si existe informe en DB por documento y número de pago
+      if (!resolvedInformeId && (docKeyToUse || cleanDoc)) {
+        const { data: rep } = await supabase
+          .from('informes_mensuales')
+          .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
+          .eq('informe_nro', parseInt(nroStr, 10) || 1)
+          .or(`contratos.profiles.documento_identidad.eq.${docKeyToUse},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+          .limit(1)
+          .maybeSingle();
+
+        if (rep?.id && isUuid(rep.id)) {
+          resolvedInformeId = rep.id;
+          if (!contratoId && (rep as any).contrato_id) {
+            contratoId = (rep as any).contrato_id;
+          }
+        }
+      }
+
+      if (resolvedInformeId && !contratoId) {
+        const { data: rep } = await supabase
+          .from('informes_mensuales')
+          .select('contrato_id')
+          .eq('id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (rep?.contrato_id && isUuid(rep.contrato_id)) {
+          contratoId = rep.contrato_id;
+        }
+      }
+
+      if (typeof data === 'object' && data !== null) {
+        if (resolvedInformeId) data.reportId = resolvedInformeId;
+        if (contratoId) data.contratoId = contratoId;
+      }
+
+      const payload: any = {
+        contratista_documento: cleanDoc || docKeyToUse,
+        pago_nro: nroStr,
+        datos_formulario: data,
+        fecha_actualizacion: new Date().toISOString()
+      };
+
+      if (resolvedInformeId && isUuid(resolvedInformeId)) {
+        payload.informe_id = resolvedInformeId;
+      }
+
+      let existingId: string | null = null;
+      if (resolvedInformeId) {
+        const { data: existingDoc } = await supabase
+          .from('autorizaciones_desembolso')
+          .select('id')
+          .eq('informe_id', resolvedInformeId)
+          .limit(1)
+          .maybeSingle();
+        if (existingDoc?.id) existingId = existingDoc.id;
+      }
+
+      if (!existingId && (docKeyToUse || cleanDoc)) {
+        const { data: existingByDoc } = await supabase
+          .from('autorizaciones_desembolso')
+          .select('id')
+          .or(`contratista_documento.eq.${docKeyToUse},contratista_documento.eq.${cleanDoc}`)
+          .eq('pago_nro', nroStr)
+          .limit(1)
+          .maybeSingle();
+        if (existingByDoc?.id) existingId = existingByDoc.id;
+      }
+
+      if (contratoId) {
+        const contractUpdate: any = {};
+        if (data?.nroCuenta) contractUpdate.numero_cuenta = data.nroCuenta;
+        if (data?.banco) contractUpdate.banco = data.banco;
+        if (data?.tipoCuenta) contractUpdate.tipo_cuenta = data.tipoCuenta;
+        if (data?.ciudad) contractUpdate.ciudad = data.ciudad;
+        if (Object.keys(contractUpdate).length > 0) {
+          await supabase.from('contratos').update(contractUpdate).eq('id', contratoId);
+        }
+      }
+      const dirValDes = data?.direccion;
+      const docValDes = cleanDoc || docKeyToUse;
+      if (dirValDes && docValDes) {
+        await supabase.from('profiles').update({ direccion: dirValDes }).or(`documento_identidad.eq.${docValDes},documento_identidad.eq.${docKeyToUse}`);
+      }
+
+      if (existingId) {
+        const { error: updateErr } = await supabase
+          .from('autorizaciones_desembolso')
+          .update(payload)
+          .eq('id', existingId);
+        if (updateErr) {
+          console.warn('Supabase update autorizaciones_desembolso error:', updateErr);
+        }
+        return { success: true, id: existingId };
+      } else {
+        const { data: inserted, error: insertErr } = await supabase
+          .from('autorizaciones_desembolso')
+          .insert([payload])
+          .select('id')
+          .maybeSingle();
+        if (insertErr) {
+          console.warn('Supabase insert autorizaciones_desembolso error:', insertErr);
+        }
+        return { success: true, id: inserted?.id };
+      }
+    } catch (e: any) {
+      console.warn('Error saving autorizacion desembolso to Supabase:', e);
+      return { success: true, id: `local-${Date.now()}` };
+    }
+  },
+
+  // 20. Obtener Autorización de Desembolso
+  async getAutorizacionDesembolso(
+    informeId?: string,
+    docIdentidad?: string,
+    pagoNro?: string
+  ): Promise<any | null> {
+    try {
+      if (informeId && isUuid(informeId)) {
+        const { data, error } = await supabase
+          .from('autorizaciones_desembolso')
+          .select('*')
+          .eq('informe_id', informeId)
+          .limit(1)
+          .maybeSingle();
+        if (!error && data?.datos_formulario) return data.datos_formulario;
+      }
+      if (docIdentidad && pagoNro) {
+        const cleanDoc = docIdentidad.replace(/[^0-9]/g, '');
+        const { data, error } = await supabase
+          .from('autorizaciones_desembolso')
+          .select('*')
+          .or(`contratista_documento.eq.${docIdentidad},contratista_documento.eq.${cleanDoc}`)
+          .eq('pago_nro', pagoNro)
+          .limit(1)
+          .maybeSingle();
+        if (!error && data?.datos_formulario) return data.datos_formulario;
+      }
+    } catch (e) {
+      console.warn('Error fetching autorizacion desembolso:', e);
+    }
+
+    if (typeof localStorage !== 'undefined') {
+      const cleanDoc = docIdentidad ? docIdentidad.replace(/[^0-9]/g, '') : '';
+      const keysToTry = [
+        `desembolso_${docIdentidad || ''}_${pagoNro || '1'}`,
+        `desembolso_${cleanDoc}_${pagoNro || '1'}`,
+        `desembolso_${informeId || ''}_${pagoNro || '1'}`,
+        `desembolso_${pagoNro || '1'}`
+      ];
+      for (const k of keysToTry) {
+        const saved = localStorage.getItem(k);
+        if (saved) {
+          try { return JSON.parse(saved); } catch (e) {}
+        }
+      }
+    }
+    return null;
+  },
+
+  // 21. Obtener el último informe guardado por un usuario (Para precarga inteligente)
+  async getLastSavedReport(contractorDocument: string, contractorId?: string): Promise<ReportData | null> {
+    try {
+      const reports = await this.getContractorReports(contractorDocument, contractorId);
+      if (reports && reports.length > 0) {
+        // Ordenar por número de informe descendente
+        const sorted = [...reports].sort((a, b) => parseInt(b.informeNro || '0', 10) - parseInt(a.informeNro || '0', 10));
+        return sorted[0];
+      }
+    } catch (e) {
+      console.warn('Error fetching last saved report from Supabase:', e);
+    }
+
+    // Fallback a LocalStorage aislado del contratista
+    if (typeof localStorage !== 'undefined' && contractorDocument) {
+      for (let i = 12; i >= 1; i--) {
+        const saved = localStorage.getItem(`informe_data_${contractorDocument}_${i}`);
+        if (saved) {
+          try {
+            return JSON.parse(saved) as ReportData;
+          } catch (e) {}
+        }
+      }
+    }
+    return null;
+  },
+
+  // 22. Obtener Notificaciones Institucionales (Filtrado estricto por usuario)
+  async getNotificaciones(userId?: string, userDoc?: string): Promise<Notificacion[]> {
+    const targetIds = [userId, userDoc].filter(Boolean) as string[];
+    if (targetIds.length === 0) return [];
+
+    let dbNotifs: Notificacion[] = [];
+    try {
+      const { data, error } = await supabase
+        .from('notificaciones')
+        .select('*')
+        .in('user_id', targetIds)
+        .order('created_at', { ascending: false })
+        .limit(30);
+
+      if (!error && data) {
+        dbNotifs = data.map((d: any) => ({
+          id: d.id,
+          user_id: d.user_id,
+          mensaje: d.mensaje,
+          tipo: d.tipo || 'info',
+          leida: Boolean(d.leida),
+          created_at: d.created_at,
+          informe_nro: d.informe_nro,
+          report_id: d.report_id,
+          titulo: d.titulo || (d.tipo === 'aprobacion' ? 'Informe Aprobado' : d.tipo === 'devolucion' ? 'Informe Devuelto' : 'Notificación')
+        }));
+      }
+    } catch (e) {
+      console.warn('Error fetching notifications from Supabase:', e);
+    }
+
+    // Unir con almacenamiento local aislado por usuario
+    const primaryKey = userDoc || userId || 'default';
+    let localNotifs: Notificacion[] = [];
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem(`notificaciones_${primaryKey}`);
+      if (saved) {
+        try {
+          localNotifs = JSON.parse(saved);
+        } catch (e) {}
+      }
+    }
+
+    // Combinar y deduplicar por id
+    const combinedMap = new Map<string, Notificacion>();
+    dbNotifs.forEach(n => combinedMap.set(n.id, n));
+    localNotifs.forEach(n => {
+      if (!combinedMap.has(n.id)) {
+        combinedMap.set(n.id, n);
+      }
+    });
+
+    const result = Array.from(combinedMap.values()).sort((a, b) => {
+      const dateA = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const dateB = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return dateB - dateA;
+    });
+
+    return result;
+  },
+
+  // 23. Crear Notificación Institucional
+  async crearNotificacion(notif: Omit<Notificacion, 'id' | 'created_at'>): Promise<Notificacion | null> {
+    const id = `notif-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+    const newNotif: Notificacion = {
+      ...notif,
+      id,
+      created_at: new Date().toISOString(),
+      leida: false,
+    };
+
+    // 1. Limpiar/consolidar notificaciones previas no leídas del mismo tipo para este mismo informe
+    try {
+      if (notif.informe_nro && (notif.tipo === 'devolucion' || notif.tipo === 'radicado')) {
+        await supabase
+          .from('notificaciones')
+          .delete()
+          .eq('user_id', notif.user_id)
+          .eq('informe_nro', notif.informe_nro)
+          .eq('tipo', notif.tipo);
+      }
+    } catch (e) {
+      console.warn('Error deduplicating notification in Supabase:', e);
+    }
+
+    // 2. Guardar en Supabase
+    try {
+      const { data, error } = await supabase
+        .from('notificaciones')
+        .insert([{
+          user_id: notif.user_id,
+          mensaje: notif.mensaje,
+          tipo: notif.tipo || 'info',
+          leida: false,
+          informe_nro: notif.informe_nro || null,
+          report_id: (notif.report_id && isUuid(notif.report_id)) ? notif.report_id : null
+        }])
+        .select('*')
+        .maybeSingle();
+
+      if (!error && data?.id) {
+        newNotif.id = data.id;
+      }
+    } catch (e) {
+      console.warn('Error saving notification to Supabase:', e);
+    }
+
+    // 3. Guardar en LocalStorage aislado del usuario (reemplazando anteriores del mismo tipo si aplica)
+    if (typeof localStorage !== 'undefined') {
+      const key = `notificaciones_${notif.user_id}`;
+      const saved = localStorage.getItem(key);
+      let list: Notificacion[] = [];
+      if (saved) {
+        try { 
+          list = JSON.parse(saved); 
+          if (notif.informe_nro && (notif.tipo === 'devolucion' || notif.tipo === 'radicado')) {
+            list = list.filter(n => !(n.informe_nro === notif.informe_nro && n.tipo === notif.tipo));
+          }
+        } catch (e) {}
+      }
+      list.unshift(newNotif);
+      localStorage.setItem(key, JSON.stringify(list.slice(0, 50)));
+    }
+
+    // 4. Emitir evento para actualización instantánea en la interfaz
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas', { detail: newNotif }));
+    }
+
+    return newNotif;
+  },
+
+  // 23.1. Marcar notificaciones de un informe como resueltas/leídas (cuando se subsana, radica o aprueba)
+  async marcarNotificacionesInformeResueltas(userDoc?: string, informeNro?: string, reportId?: string): Promise<boolean> {
+    if (!userDoc && !reportId && !informeNro) return false;
+    try {
+      if (userDoc && informeNro) {
+        await supabase
+          .from('notificaciones')
+          .update({ leida: true })
+          .eq('user_id', userDoc)
+          .eq('informe_nro', informeNro)
+          .eq('tipo', 'devolucion');
+      }
+      if (reportId && isUuid(reportId)) {
+        await supabase
+          .from('notificaciones')
+          .update({ leida: true })
+          .eq('report_id', reportId)
+          .eq('tipo', 'devolucion');
+      }
+    } catch (e) {
+      console.warn('Error resolving report notifications in Supabase:', e);
+    }
+
+    if (typeof localStorage !== 'undefined') {
+      const keys = [userDoc, 'supervisor'].filter(Boolean) as string[];
+      for (const k of keys) {
+        const storageKey = `notificaciones_${k}`;
+        const saved = localStorage.getItem(storageKey);
+        if (saved) {
+          try {
+            const list: Notificacion[] = JSON.parse(saved);
+            const updated = list.map(n => {
+              if (
+                (informeNro && n.informe_nro === informeNro && n.tipo === 'devolucion') || 
+                (reportId && n.report_id === reportId && n.tipo === 'devolucion')
+              ) {
+                return { ...n, leida: true };
+              }
+              return n;
+            });
+            localStorage.setItem(storageKey, JSON.stringify(updated));
+          } catch (e) {}
+        }
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+    }
+    return true;
+  },
+
+  // 23.2. Marcar notificaciones de radicado de un informe como leídas (para el supervisor/secretaría)
+  async marcarNotificacionesRadicadasComoLeidas(informeNro?: string, reportId?: string): Promise<boolean> {
+    if (!reportId && !informeNro) return false;
+    try {
+      let query = supabase
+        .from('notificaciones')
+        .update({ leida: true })
+        .eq('tipo', 'radicado');
+
+      if (reportId && isUuid(reportId)) {
+        await query.eq('report_id', reportId);
+      } else if (informeNro) {
+        await query.eq('informe_nro', informeNro);
+      }
+    } catch (e) {
+      console.warn('Error resolving radicado notifications in Supabase:', e);
+    }
+
+    if (typeof localStorage !== 'undefined') {
+      const keys = ['supervisor', 'supervisor_apoyo', 'admin'];
+      for (const k of keys) {
+        const storageKey = `notificaciones_${k}`;
+        const saved = localStorage.getItem(storageKey);
+        if (saved) {
+          try {
+            const list: Notificacion[] = JSON.parse(saved);
+            const updated = list.map(n => {
+              if (
+                (informeNro && n.informe_nro === informeNro && n.tipo === 'radicado') || 
+                (reportId && n.report_id === reportId && n.tipo === 'radicado')
+              ) {
+                return { ...n, leida: true };
+              }
+              return n;
+            });
+            localStorage.setItem(storageKey, JSON.stringify(updated));
+          } catch (e) {}
+        }
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+    }
+    return true;
+  },
+
+  // 24. Marcar Notificación como Leída
+  async marcarNotificacionLeida(notifId: string, userDoc?: string): Promise<boolean> {
+    try {
+      if (isUuid(notifId)) {
+        await supabase
+          .from('notificaciones')
+          .update({ leida: true })
+          .eq('id', notifId);
+      }
+    } catch (e) {
+      console.warn('Error marking notification as read in Supabase:', e);
+    }
+
+    if (typeof localStorage !== 'undefined' && userDoc) {
+      const key = `notificaciones_${userDoc}`;
+      const saved = localStorage.getItem(key);
+      if (saved) {
+        try {
+          const list: Notificacion[] = JSON.parse(saved);
+          const updated = list.map(n => n.id === notifId ? { ...n, leida: true } : n);
+          localStorage.setItem(key, JSON.stringify(updated));
+        } catch (e) {}
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+    }
+    return true;
+  },
+
+  // 25. Marcar Todas las Notificaciones como Leídas
+  async marcarTodasNotificacionesLeidas(userId?: string, userDoc?: string): Promise<boolean> {
+    const targetIds = [userId, userDoc].filter(Boolean) as string[];
+    if (targetIds.length === 0) return false;
+
+    try {
+      await supabase
+        .from('notificaciones')
+        .update({ leida: true })
+        .in('user_id', targetIds);
+    } catch (e) {
+      console.warn('Error marking all notifications as read in Supabase:', e);
+    }
+
+    const primaryKey = userDoc || userId;
+    if (typeof localStorage !== 'undefined' && primaryKey) {
+      const key = `notificaciones_${primaryKey}`;
+      const saved = localStorage.getItem(key);
+      if (saved) {
+        try {
+          const list: Notificacion[] = JSON.parse(saved);
+          const updated = list.map(n => ({ ...n, leida: true }));
+          localStorage.setItem(key, JSON.stringify(updated));
+        } catch (e) {}
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+    }
+    return true;
+  },
+
+  // 26. Eliminar Notificación Individual
+  async eliminarNotificacion(notifId: string, userDoc?: string, userId?: string): Promise<boolean> {
+    try {
+      if (isUuid(notifId)) {
+        await supabase
+          .from('notificaciones')
+          .delete()
+          .eq('id', notifId);
+      }
+    } catch (e) {
+      console.warn('Error deleting notification from Supabase:', e);
+    }
+
+    const keys = [userDoc, userId].filter(Boolean);
+    if (typeof localStorage !== 'undefined') {
+      for (const k of keys) {
+        const storageKey = `notificaciones_${k}`;
+        const saved = localStorage.getItem(storageKey);
+        if (saved) {
+          try {
+            const list: Notificacion[] = JSON.parse(saved);
+            const updated = list.filter(n => n.id !== notifId);
+            localStorage.setItem(storageKey, JSON.stringify(updated));
+          } catch (e) {}
+        }
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+    }
+    return true;
+  },
+
+  // 27. Limpiar Todas las Notificaciones de un Usuario
+  async limpiarTodasNotificaciones(userId?: string, userDoc?: string): Promise<boolean> {
+    const targetIds = [userId, userDoc].filter(Boolean) as string[];
+    if (targetIds.length === 0) return false;
+
+    try {
+      await supabase
+        .from('notificaciones')
+        .delete()
+        .in('user_id', targetIds);
+    } catch (e) {
+      console.warn('Error clearing notifications from Supabase:', e);
+    }
+
+    if (typeof localStorage !== 'undefined') {
+      for (const target of targetIds) {
+        localStorage.removeItem(`notificaciones_${target}`);
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('notificaciones_actualizadas'));
+    }
+    return true;
+  },
+
+  // 28. Configuración Global de Inteligencia Artificial (Google Gemini)
+  async getAIConfig(): Promise<{ apiKey: string; modelo: string } | null> {
+    try {
+      const { data, error } = await supabase
+        .from('configuracion_ia')
+        .select('*')
+        .eq('id', 'global_config')
+        .maybeSingle();
+
+      if (!error && data && data.api_key) {
+        return {
+          apiKey: data.api_key,
+          modelo: data.modelo || 'gemini-3.8-flash'
+        };
+      }
+    } catch (e) {
+      console.warn('Configuración IA no encontrada en Supabase o tabla no creada aún:', e);
+    }
+    return null;
+  },
+
+  async saveAIConfig(apiKey: string, modelo: string, userEmail?: string): Promise<boolean> {
+    try {
+      const payload = {
+        id: 'global_config',
+        api_key: apiKey.trim(),
+        modelo: modelo.trim(),
+        updated_at: new Date().toISOString(),
+        updated_by: userEmail || 'superadmin'
+      };
+
+      const { error } = await supabase
+        .from('configuracion_ia')
+        .upsert(payload, { onConflict: 'id' });
+
+      if (error) {
+        console.warn('Aviso al guardar config IA en Supabase:', error.message);
+      }
+    } catch (e) {
+      console.warn('Error al guardar config IA en Supabase:', e);
+    }
+    return true;
+  },
+
+  // 28.b Datos contractuales reales del contratista (tabla 'contratos')
+  // Fuente de verdad para el Informe Final: numero de contrato, objeto, supervisor,
+  // plazo, fechas y dependencia salen de la BD, no de inferencias del perfil.
+  // IMPORTANTE: contratos.contratista_id es uuid. Nunca se debe comparar contra el
+  // documento de identidad: PostgREST responde 400 (22P02) y anula la consulta.
+  async getContratoDeContratista(
+    contratistaId?: string,
+    documentoIdentidad?: string
+  ): Promise<ContratoContratista | null> {
+    const esUuid = (v?: string) =>
+      !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v.trim());
+    const cleanDoc = (documentoIdentidad || '').trim().replace(/[^0-9]/g, '');
+
+    const esNroValido = (n?: any) =>
+      n !== null &&
+      n !== undefined &&
+      String(n).trim() !== '' &&
+      !/^20[0-9]{2}$/.test(String(n).trim());
+
+    const COLUMNAS = '*, sec_secretarias(nombre, codigo)';
+
+    const consultarPorId = async (id: string) => {
+      const { data, error } = await supabase
+        .from('contratos')
+        .select(COLUMNAS)
+        .eq('contratista_id', id)
+        .order('created_at', { ascending: false })
+        .limit(5);
+      if (error) {
+        console.warn('Error consultando contratos por contratista_id:', error.message);
+        return [];
+      }
+      return data || [];
+    };
+
+    try {
+      let filas: any[] = [];
+
+      if (esUuid(contratistaId)) {
+        filas = await consultarPorId(contratistaId as string);
+      }
+
+      // Respaldo: resolver el id del perfil a partir del documento de identidad
+      if (filas.length === 0 && cleanDoc) {
+        const { data: perfil } = await supabase
+          .from('profiles')
+          .select('id')
+          .eq('documento_identidad', cleanDoc)
+          .maybeSingle();
+
+        if (perfil && esUuid(perfil.id)) {
+          filas = await consultarPorId(perfil.id);
+        }
+      }
+
+      if (filas.length === 0) return null;
+
+      // Preferir la fila con un numero de contrato asignado sobre una vacia o sin numero
+      const fila = filas.find((f: any) => esNroValido(f.contrato_nro)) || filas[0];
+      if (!fila) return null;
+
+      const anioFecha = fila.fecha_inicio ? String(fila.fecha_inicio).slice(0, 4) : '';
+      const vigencia = fila.vigencia
+        ? String(fila.vigencia).trim()
+        : (/^20[0-9]{2}$/.test(anioFecha) ? anioFecha : '');
+
+      // El cargo del supervisor no esta en 'contratos'; se toma de su perfil
+      let supervisorCargo = '';
+      const docSupervisor = String(fila.supervisor_documento || '').replace(/[^0-9]/g, '');
+      if (docSupervisor) {
+        try {
+          const { data: sup } = await supabase
+            .from('profiles')
+            .select('cargo')
+            .eq('documento_identidad', docSupervisor)
+            .maybeSingle();
+          supervisorCargo = sup?.cargo || '';
+        } catch (se) {}
+      }
+
+      return {
+        contratoId: fila.id,
+        contratoNro: esNroValido(fila.contrato_nro) ? String(fila.contrato_nro).trim() : '',
+        vigencia,
+        objeto: (fila.objeto || '').trim(),
+        valorContrato: fila.valor_contrato ? formatColombianCurrency(fila.valor_contrato) : '',
+        plazoMeses: fila.plazo_meses ? String(fila.plazo_meses) : '',
+        fechaInicio: fila.fecha_inicio || '',
+        fechaTerminacion: fila.fecha_terminacion || '',
+        supervisorNombre: (fila.supervisor_nombre || '').trim(),
+        supervisorDocumento: (fila.supervisor_documento || '').trim(),
+        supervisorCargo,
+        apoyoSupervisionNombre: (fila.apoyo_supervision_nombre || '').trim(),
+        cdpNro: (fila.cdp_nro || '').trim(),
+        crpNro: (fila.crp_nro || '').trim(),
+        polizaNro: (fila.poliza_nro || '').trim(),
+        dependencia: (fila.sec_secretarias?.nombre || '').trim(),
+        secretariaCodigo: (fila.sec_secretarias?.codigo || '').trim(),
+        secretariaId: fila.secretaria_id || '',
+        numeroCuenta: (fila.numero_cuenta || '').trim(),
+        banco: (fila.banco || '').trim(),
+        tipoCuenta: (fila.tipo_cuenta || '').trim(),
+        ciudad: (fila.ciudad || '').trim()
+      };
+    } catch (e) {
+      console.warn('No se pudieron obtener los datos del contrato:', e);
+      return null;
+    }
+  },
+
+  // 29. Guardar y Obtener Informe Final de Ejecución Contractual
+  async getInformeFinal(documentoIdentidad: string, contratoNro?: string): Promise<InformeFinalData | null> {
+    if (!documentoIdentidad) return null;
+    const cleanDoc = documentoIdentidad.trim().replace(/\D/g, '');
+
+    // 1. Intentar consultar tabla dedicada 'informes_finales'
+    // El Informe Final es único por contratista (ver uq_informe_final_documento),
+    // no por contrato: contrato_nro se guarda con formatos distintos según el
+    // momento del guardado (ej. "CPS 590 de 2026" vs "590"), así que filtrar
+    // por igualdad exacta de contrato_nro aquí hacía que la búsqueda fallara en
+    // silencio y nunca encontrara el informe ya guardado. El parámetro
+    // contratoNro ya no se usa como filtro, solo se conserva por compatibilidad
+    // con quienes lo invocan.
+    try {
+      const query = supabase
+        .from('informes_finales')
+        .select('*')
+        .or(`documento_identidad.eq.${cleanDoc},documento_identidad.eq.${documentoIdentidad}`);
+
+      const { data, error } = await query.order('updated_at', { ascending: false }).limit(1).maybeSingle();
+
+      if (!error && data) {
+        let userProf: any = null;
+        try {
+          userProf = await this.getUserProfile(documentoIdentidad);
+        } catch (ue) {}
+
+        return {
+          id: data.id,
+          userId: data.user_id,
+          documentoIdentidad: data.documento_identidad,
+          contratistaDocumento: data.documento_identidad,
+          contratistaNombre: data.contratista_nombre || userProf?.nombreCompleto || '',
+          contratistaLugarDoc: data.contratista_lugar_doc || 'Quibdó',
+          contratoNro: data.contrato_nro || userProf?.contratoNro || contratoNro || '',
+          dependencia: data.dependencia || userProf?.secretariaNombre || '',
+          supervisorNombre: data.supervisor_nombre || userProf?.supervisorNombre || '',
+          supervisorCargo: data.supervisor_cargo || userProf?.supervisorCargo || '',
+          objetoContractual: data.objeto_contractual || userProf?.objetoContrato || '',
+          metaPlanDesarrollo: data.meta_plan_desarrollo || '',
+          indicador: data.indicador || '',
+          fechaPresentacion: data.fecha_presentacion || '',
+          introduccion: data.introduccion || '',
+          metodologiaEnfoque: data.metodologia_enfoque || '',
+          metodologiaEstrategias: data.metodologia_estrategias || '',
+          metodologiaZonas: data.metodologia_zonas || '',
+          metodologiaHerramientas: data.metodologia_herramientas || '',
+          cuadroActividades: data.cuadro_actividades || [],
+          productosEntregados: data.productos_entregados || [],
+          resultadosAlcanzados: data.resultados_alcanzados || [],
+          cumplimientoMeta: data.cumplimiento_meta || '',
+          analisisTecnico: data.analisis_tecnico || '',
+          impactoEjecucion: data.impacto_ejecucion || '',
+          conclusiones: data.conclusiones || '',
+          recomendaciones: data.recomendaciones || [],
+          anexosFotograficos: data.anexos_fotograficos || [],
+          generadoConIA: data.generado_con_ia || false,
+          fechaGeneracionIA: data.fecha_generacion_ia,
+          updatedAt: data.updated_at
+        } as InformeFinalData;
+      }
+    } catch (e) {
+      console.warn('Informe final no recuperado de tabla dedicada informes_finales:', e);
+    }
+
+    // 2. Respaldo: Consultar en informes_mensuales donde tipo_informe = 'Final'
+    try {
+      const { data: prof } = await supabase
+        .from('profiles')
+        .select('id, contratos(id)')
+        .or(`documento_identidad.eq.${cleanDoc},documento_identidad.eq.${documentoIdentidad}`)
+        .limit(1)
+        .maybeSingle();
+
+      const contratoId = Array.isArray(prof?.contratos) 
+        ? prof?.contratos?.[0]?.id 
+        : (prof?.contratos as any)?.id;
+      if (contratoId) {
+        const { data: infFinal } = await supabase
+          .from('informes_mensuales')
+          .select('observaciones, created_at')
+          .eq('contrato_id', contratoId)
+          .eq('tipo_informe', 'Final')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (infFinal?.observaciones && infFinal.observaciones.startsWith('[INFORME_FINAL_JSON]:')) {
+          const raw = infFinal.observaciones.replace('[INFORME_FINAL_JSON]:', '');
+          const parsed = JSON.parse(raw);
+          return {
+            contratistaDocumento: parsed.documento_identidad || documentoIdentidad,
+            contratoNro: parsed.contrato_nro || '',
+            contratistaNombre: parsed.contratista_nombre || '',
+            contratistaLugarDoc: parsed.contratista_lugar_doc || 'Quibdó',
+            dependencia: parsed.dependencia || '',
+            supervisorNombre: parsed.supervisor_nombre || '',
+            supervisorCargo: parsed.supervisor_cargo || '',
+            objetoContractual: parsed.objeto_contractual || '',
+            metaPlanDesarrollo: parsed.meta_plan_desarrollo || '',
+            indicador: parsed.indicador || '',
+            fechaPresentacion: parsed.fecha_presentacion || '',
+            introduccion: parsed.introduccion || '',
+            metodologiaEnfoque: parsed.metodologia_enfoque || '',
+            metodologiaEstrategias: parsed.metodologia_estrategias || '',
+            metodologiaZonas: parsed.metodologia_zonas || '',
+            metodologiaHerramientas: parsed.metodologia_herramientas || '',
+            cuadroActividades: parsed.cuadro_actividades || [],
+            productosEntregados: parsed.productos_entregados || [],
+            resultadosAlcanzados: parsed.resultados_alcanzados || [],
+            cumplimientoMeta: parsed.cumplimiento_meta || '',
+            analisisTecnico: parsed.analisis_tecnico || '',
+            impactoEjecucion: parsed.impacto_ejecucion || '',
+            conclusiones: parsed.conclusiones || '',
+            recomendaciones: parsed.recomendaciones || [],
+            anexosFotograficos: parsed.anexos_fotograficos || [],
+            generadoConIA: parsed.generado_con_ia || false,
+            fechaGeneracionIA: parsed.fecha_generacion_ia,
+            updatedAt: parsed.updated_at
+          } as InformeFinalData;
+        }
+      }
+    } catch (e) {
+      console.warn('Informe final no recuperado de informes_mensuales:', e);
+    }
+
+    return null;
+  },
+
+  async deleteInformeFinal(documentoIdentidad: string, contratoNro?: string): Promise<boolean> {
+    if (!documentoIdentidad) return false;
+    const cleanDoc = documentoIdentidad.trim().replace(/\D/g, '');
+    try {
+      await supabase.from('informes_finales').delete().or(`documento_identidad.eq.${cleanDoc},documento_identidad.eq.${documentoIdentidad}`);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+
+  async saveInformeFinal(data: InformeFinalData, user?: AuthUser): Promise<boolean> {
+    const docId = data?.contratistaDocumento || user?.documentoIdentidad || '';
+    if (!data || !docId) return false;
+    const cleanDoc = docId.trim().replace(/\D/g, '');
+
+    const payload: any = {
+      documento_identidad: cleanDoc || docId,
+      contrato_nro: data.contratoNro || user?.contratoNro || '',
+      user_id: data.userId || user?.id || null,
+      contratista_nombre: data.contratistaNombre || user?.nombreCompleto || '',
+      contratista_lugar_doc: data.contratistaLugarDoc || 'Quibdó',
+      dependencia: data.dependencia || user?.secretariaNombre || '',
+      supervisor_nombre: data.supervisorNombre || user?.supervisorNombre || '',
+      supervisor_cargo: data.supervisorCargo || user?.supervisorCargo || '',
+      objeto_contractual: data.objetoContractual || user?.objetoContrato || '',
+      fecha_presentacion: data.fechaPresentacion || '',
+      meta_plan_desarrollo: data.metaPlanDesarrollo || '',
+      indicador: data.indicador || '',
+      introduccion: data.introduccion || '',
+      metodologia_enfoque: data.metodologiaEnfoque || '',
+      metodologia_estrategias: data.metodologiaEstrategias || '',
+      metodologia_zonas: data.metodologiaZonas || '',
+      metodologia_herramientas: data.metodologiaHerramientas || '',
+      cuadro_actividades: data.cuadroActividades || [],
+      productos_entregados: data.productosEntregados || [],
+      resultados_alcanzados: data.resultadosAlcanzados || [],
+      cumplimiento_meta: data.cumplimientoMeta || '',
+      analisis_tecnico: data.analisisTecnico || '',
+      impacto_ejecucion: data.impactoEjecucion || '',
+      conclusiones: data.conclusiones || '',
+      recomendaciones: data.recomendaciones || [],
+      anexos_fotograficos: data.anexosFotograficos || [],
+      generado_con_ia: data.generadoConIA || false,
+      fecha_generacion_ia: data.fechaGeneracionIA || null,
+      updated_at: new Date().toISOString()
+    };
+
+    let dedicatedSaved = false;
+
+    // 1. Intentar guardar en tabla dedicada 'informes_finales'
+    try {
+      let { error } = await supabase
+        .from('informes_finales')
+        .upsert(payload, { onConflict: 'documento_identidad' });
+
+      if (error && error.message && error.message.toLowerCase().includes('column')) {
+        // Si una columna no existe en la tabla de Supabase, eliminar campos opcionales no existentes y reintentar
+        const payloadRetry = { ...payload };
+        const match = error.message.match(/Could not find the '([^']+)' column/i);
+        if (match && match[1]) {
+          delete payloadRetry[match[1]];
+        } else {
+          delete payloadRetry.contratista_lugar_doc;
+          delete payloadRetry.contratista_nombre;
+          delete payloadRetry.dependencia;
+          delete payloadRetry.supervisor_nombre;
+          delete payloadRetry.supervisor_cargo;
+          delete payloadRetry.objeto_contractual;
+        }
+
+        const retryRes = await supabase
+          .from('informes_finales')
+          .upsert(payloadRetry, { onConflict: 'documento_identidad' });
+        
+        error = retryRes.error;
+        if (error && error.message && error.message.toLowerCase().includes('column')) {
+          // Segundo intento más conservador
+          delete payloadRetry.contratista_lugar_doc;
+          delete payloadRetry.contratista_nombre;
+          delete payloadRetry.dependencia;
+          delete payloadRetry.supervisor_nombre;
+          delete payloadRetry.supervisor_cargo;
+          delete payloadRetry.objeto_contractual;
+          const retryRes2 = await supabase
+            .from('informes_finales')
+            .upsert(payloadRetry, { onConflict: 'documento_identidad' });
+          error = retryRes2.error;
+        }
+      }
+
+      if (!error) {
+        dedicatedSaved = true;
+      }
+    } catch (e) {
+      // Ignorar excepciones secundarias de la tabla dedicada
+    }
+
+    // 2. Guardar también como respaldo persistente en 'informes_mensuales' con tipo_informe='Final'
+    try {
+      const { data: prof } = await supabase
+        .from('profiles')
+        .select('id, contratos(id)')
+        .or(`documento_identidad.eq.${cleanDoc},documento_identidad.eq.${docId}`)
+        .limit(1)
+        .maybeSingle();
+
+      const contratoId = Array.isArray(prof?.contratos) 
+        ? prof?.contratos?.[0]?.id 
+        : (prof?.contratos as any)?.id;
+      if (contratoId) {
+        const backupRow = {
+          contrato_id: contratoId,
+          informe_nro: 99,
+          tipo_informe: 'Final',
+          fecha_presentacion: data.fechaPresentacion || new Date().toLocaleDateString('es-CO'),
+          periodo_desde: '01/01/2026',
+          periodo_hasta: data.fechaPresentacion || '31/12/2026',
+          observaciones: `[INFORME_FINAL_JSON]:${JSON.stringify(payload)}`,
+          estado: 'Borrador'
+        };
+
+        await supabase
+          .from('informes_mensuales')
+          .upsert(backupRow, { onConflict: 'contrato_id,informe_nro' });
+      }
+    } catch (bkErr) {
+      console.warn('Aviso guardando respaldo en informes_mensuales:', bkErr);
+    }
+
+    return true;
+  },
+
+  // 24. Módulo de Documentos e Instructivos Institucionales (Supabase Storage: Bucket anexos/documentos)
+  async getSecretariaDocumentos(secretariaId?: string): Promise<SecretariaDocumento[]> {
+    const localList: SecretariaDocumento[] = [];
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('alcaldia_quibdo_secretaria_docs');
+      if (saved) {
+        try {
+          localList.push(...JSON.parse(saved));
+        } catch (e) {}
+      }
+    }
+
+    try {
+      // Obtener archivos remotos guardados en Supabase Storage (Bucket anexos / Carpeta documentos)
+      const { data: storageFiles, error: storageErr } = await supabase
+        .storage
+        .from('anexos')
+        .list('documentos');
+
+      if (!storageErr && storageFiles && storageFiles.length > 0) {
+        const remoteDocs: SecretariaDocumento[] = storageFiles
+          .filter(f => f.name && !f.name.startsWith('.'))
+          .map(file => {
+            const path = `documentos/${file.name}`;
+            const { data: publicUrlData } = supabase.storage.from('anexos').getPublicUrl(path);
+            const url = publicUrlData?.publicUrl || '';
+
+            // Asociar con metadatos guardados previamente en local si existen
+            const matchedLocal = localList.find(
+              l => l.storagePath === path || (l.fileUrl && l.fileUrl === url) || (l.id && file.name.includes(l.id))
+            );
+
+            if (matchedLocal) {
+              return {
+                ...matchedLocal,
+                fileUrl: url || matchedLocal.fileUrl,
+                storagePath: path,
+                fileSize: file.metadata?.size || matchedLocal.fileSize,
+              };
+            }
+
+            const cleanName = file.name.replace(/^[a-f0-9-]{36}_/, '').replace(/_/g, ' ');
+            const isPdf = file.name.endsWith('.pdf');
+            const isWord = file.name.endsWith('.doc') || file.name.endsWith('.docx');
+            const isExcel = file.name.endsWith('.xls') || file.name.endsWith('.xlsx');
+
+            let mimeType = 'application/octet-stream';
+            if (isPdf) mimeType = 'application/pdf';
+            else if (isWord) mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            else if (isExcel) mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+            return {
+              id: file.id || file.name,
+              secretariaId: secretariaId || '170',
+              nombre: cleanName.replace(/\.[^/.]+$/, ''),
+              categoria: 'Formatos Institucionales',
+              descripcion: '',
+              fileName: cleanName,
+              fileSize: file.metadata?.size || 0,
+              mimeType,
+              fileUrl: url,
+              storagePath: path,
+              fechaSubida: file.created_at ? formatDateSlash(file.created_at) : new Date().toLocaleDateString('es-CO'),
+            };
+          });
+
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('alcaldia_quibdo_secretaria_docs', JSON.stringify(remoteDocs));
+        }
+
+        return remoteDocs;
+      }
+    } catch (e) {
+      console.warn('Aviso al sincronizar Supabase Storage anexos/documentos:', e);
+    }
+
+    return localList;
+  },
+
+  async saveSecretariaDocumento(doc: {
+    secretariaId?: string;
+    nombre: string;
+    categoria?: string;
+    descripcion?: string;
+    fileName: string;
+    fileSize: number;
+    mimeType: string;
+    fileUrl: string;
+    subidoPorNombre?: string;
+    subidoPorDocumento?: string;
+    file?: File;
+  }): Promise<{ success: boolean; doc?: SecretariaDocumento; error?: string }> {
+    try {
+      const id = crypto.randomUUID();
+      let finalFileUrl = doc.fileUrl;
+      let finalStoragePath = '';
+
+      if (doc.file) {
+        try {
+          const cleanFileName = doc.fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+          // Guardar en el bucket 'anexos' de Supabase Storage bajo la ruta 'documentos/'
+          finalStoragePath = `documentos/${id}_${cleanFileName}`;
+
+          const { data: uploadData, error: uploadErr } = await supabase
+            .storage
+            .from('anexos')
+            .upload(finalStoragePath, doc.file, { upsert: true });
+
+          if (!uploadErr && uploadData) {
+            const { data: publicUrlData } = supabase.storage.from('anexos').getPublicUrl(finalStoragePath);
+            if (publicUrlData?.publicUrl) {
+              finalFileUrl = publicUrlData.publicUrl;
+            }
+          } else if (uploadErr) {
+            console.warn('Supabase Storage upload error:', uploadErr);
+          }
+        } catch (stErr) {
+          console.warn('Storage upload error:', stErr);
+        }
+      }
+
+      const newDoc: SecretariaDocumento = {
+        id,
+        secretariaId: doc.secretariaId || '170',
+        nombre: doc.nombre,
+        categoria: doc.categoria || 'General',
+        descripcion: doc.descripcion || '',
+        fileName: doc.fileName,
+        fileSize: doc.fileSize,
+        mimeType: doc.mimeType,
+        fileUrl: finalFileUrl,
+        storagePath: finalStoragePath,
+        fechaSubida: new Date().toLocaleDateString('es-CO'),
+        subidoPorNombre: doc.subidoPorNombre || '',
+        subidoPorDocumento: doc.subidoPorDocumento || '',
+      };
+
+      if (typeof localStorage !== 'undefined') {
+        const saved = localStorage.getItem('alcaldia_quibdo_secretaria_docs');
+        const list: SecretariaDocumento[] = saved ? JSON.parse(saved) : [];
+        const filtered = list.filter(d => d.id !== id);
+        filtered.unshift(newDoc);
+        localStorage.setItem('alcaldia_quibdo_secretaria_docs', JSON.stringify(filtered));
+      }
+
+      return { success: true, doc: newDoc };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Error al guardar el documento' };
+    }
+  },
+
+  async deleteSecretariaDocumento(id: string, fileUrl?: string, storagePath?: string): Promise<boolean> {
+    try {
+      // 1. Eliminar archivo físico de Supabase Storage (Bucket anexos / Carpeta documentos/)
+      let pathToRemove = storagePath;
+      if (!pathToRemove && fileUrl && fileUrl.includes('/storage/v1/object/public/anexos/')) {
+        pathToRemove = fileUrl.split('/storage/v1/object/public/anexos/')[1];
+      }
+
+      if (pathToRemove) {
+        await supabase.storage.from('anexos').remove([pathToRemove]);
+      } else if (id) {
+        const { data: files } = await supabase.storage.from('anexos').list('documentos');
+        if (files && files.length > 0) {
+          const matching = files.filter(f => f.name.includes(id));
+          if (matching.length > 0) {
+            const paths = matching.map(m => `documentos/${m.name}`);
+            await supabase.storage.from('anexos').remove(paths);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Error eliminando archivo de Supabase Storage:', e);
+    }
+
+    // 2. Limpiar registro local
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('alcaldia_quibdo_secretaria_docs');
+      if (saved) {
+        try {
+          const list: SecretariaDocumento[] = JSON.parse(saved);
+          const filtered = list.filter(d => d.id !== id && d.storagePath !== storagePath && d.fileUrl !== fileUrl);
+          localStorage.setItem('alcaldia_quibdo_secretaria_docs', JSON.stringify(filtered));
+        } catch (e) {}
+      }
+    }
+    return true;
+  },
+
+  // 25. Módulo de Firma Digitalizada del Contratista (Bucket Supabase: firma y Tabla profiles)
+  async uploadFirmaContratista(userDoc: string, file: File, previousUrl?: string): Promise<{ success: boolean; url?: string; error?: string }> {
+    try {
+      const cleanDoc = userDoc ? userDoc.replace(/[^0-9a-zA-Z]/g, '') : 'contratista';
+      const ext = file.name.split('.').pop()?.toLowerCase() || 'png';
+      const fileName = `${cleanDoc}_firma_${Date.now()}.${ext}`;
+
+      // 1. Eliminar automáticamente cualquier archivo de firma anterior de este contratista en el bucket 'firma'
+      try {
+        if (previousUrl && previousUrl.includes('/storage/v1/object/public/firma/')) {
+          const oldPath = previousUrl.split('/storage/v1/object/public/firma/')[1];
+          if (oldPath) {
+            await supabase.storage.from('firma').remove([oldPath]);
+          }
+        }
+
+        const { data: existingFiles } = await supabase.storage.from('firma').list('');
+        if (existingFiles && existingFiles.length > 0) {
+          const oldMatching = existingFiles.filter(f => f.name.startsWith(`${cleanDoc}_firma_`));
+          if (oldMatching.length > 0) {
+            await supabase.storage.from('firma').remove(oldMatching.map(m => m.name));
+          }
+        }
+      } catch (cleanErr) {
+        console.warn('Aviso limpiando archivos previos de firma en Supabase:', cleanErr);
+      }
+
+      let finalUrl = '';
+
+      // 2. Subida directa del nuevo archivo al bucket 'firma' en Supabase Storage
+      const { data: uploadData, error: uploadErr } = await supabase
+        .storage
+        .from('firma')
+        .upload(fileName, file, { upsert: true, contentType: file.type || 'image/png' });
+
+      if (uploadErr) {
+        console.error('Error subiendo al bucket firma de Supabase:', uploadErr);
+        return { success: false, error: uploadErr.message || 'Error al subir la firma al bucket' };
+      }
+
+      if (uploadData) {
+        const { data: publicUrlData } = supabase.storage.from('firma').getPublicUrl(fileName);
+        if (publicUrlData?.publicUrl) {
+          finalUrl = publicUrlData.publicUrl;
+        }
+      }
+
+      if (!finalUrl) {
+        return { success: false, error: 'No se pudo obtener la URL pública de la firma' };
+      }
+
+      // 3. Guardar en la tabla 'profiles' de Supabase (columna firma_url)
+      if (userDoc) {
+        try {
+          await supabase
+            .from('profiles')
+            .update({ firma_url: finalUrl })
+            .or(`documento_identidad.eq.${userDoc},documento_identidad.eq.${cleanDoc}`);
+        } catch (dbErr) {
+          console.warn('Aviso al actualizar profiles con firma_url:', dbErr);
+        }
+      }
+
+      // 4. Limpiar cualquier clave residual de localStorage para garantizar almacenamiento exclusivo en nube
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(`alcaldia_quibdo_firma_${cleanDoc}`);
+        localStorage.removeItem('alcaldia_quibdo_global_firma');
+      }
+
+      // 5. Notificar a todas las vistas y componentes abiertos para actualizar la firma en tiempo real
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('firma_contratista_actualizada', { detail: { url: finalUrl, userDoc } }));
+      }
+
+      return { success: true, url: finalUrl };
+    } catch (err: any) {
+      console.error('Error en uploadFirmaContratista:', err);
+      return { success: false, error: err?.message || 'Error al procesar la firma' };
+    }
+  },
+
+  async deleteFirmaContratista(userDoc: string, fileUrl?: string): Promise<boolean> {
+    const cleanDoc = userDoc ? userDoc.replace(/[^0-9a-zA-Z]/g, '') : 'contratista';
+
+    try {
+      // 1. Eliminar archivo físico de Supabase Storage en el bucket 'firma'
+      let pathToRemove = '';
+      if (fileUrl && fileUrl.includes('/storage/v1/object/public/firma/')) {
+        pathToRemove = fileUrl.split('/storage/v1/object/public/firma/')[1];
+      }
+
+      if (pathToRemove) {
+        await supabase.storage.from('firma').remove([pathToRemove]);
+      } else {
+        const { data: files } = await supabase.storage.from('firma').list('');
+        if (files && files.length > 0) {
+          const matching = files.filter(f => f.name.includes(cleanDoc));
+          if (matching.length > 0) {
+            await supabase.storage.from('firma').remove(matching.map(m => m.name));
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Error eliminando firma de Supabase Storage:', e);
+    }
+
+    // 2. Limpiar columna firma_url en la tabla 'profiles' de Supabase
+    if (userDoc) {
+      try {
+        await supabase
+          .from('profiles')
+          .update({ firma_url: null })
+          .or(`documento_identidad.eq.${userDoc},documento_identidad.eq.${cleanDoc}`);
+      } catch (e) {}
+    }
+
+    // 3. Limpiar cualquier clave residual de localStorage
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(`alcaldia_quibdo_firma_${cleanDoc}`);
+      localStorage.removeItem('alcaldia_quibdo_global_firma');
+    }
+
+    // 4. Notificar a todos los componentes
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('firma_contratista_actualizada', { detail: { url: '', userDoc } }));
+    }
+
+    return true;
+  },
+
+  async getFirmaContratista(userDoc: string): Promise<string | null> {
+    const cleanDoc = userDoc ? userDoc.replace(/[^0-9a-zA-Z]/g, '') : 'contratista';
+
+    try {
+      // 1. Consultar directamente en la tabla 'profiles' de Supabase
+      if (userDoc) {
+        const { data } = await supabase
+          .from('profiles')
+          .select('firma_url')
+          .or(`documento_identidad.eq.${userDoc},documento_identidad.eq.${cleanDoc}`)
+          .limit(1)
+          .maybeSingle();
+
+        if (data?.firma_url) {
+          return data.firma_url;
+        }
+      }
+
+      // 2. Si no está en profiles, verificar si existe el archivo en el bucket 'firma'
+      const { data: files } = await supabase.storage.from('firma').list('');
+      if (files && files.length > 0) {
+        const matching = files.filter(f => f.name.includes(cleanDoc));
+        if (matching.length > 0) {
+          const sorted = matching.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+          const { data: pUrl } = supabase.storage.from('firma').getPublicUrl(sorted[0].name);
+          if (pUrl?.publicUrl) {
+            return pUrl.publicUrl;
+          }
+        }
+      }
+    } catch (e) {}
+
+    return null;
+  },
+
+  // 26. Módulo de Gestión del Logo Institucional de la Alcaldía (Supabase Storage: anexos/logo/logo alcaldia.png)
+  async uploadLogoAlcaldia(file: File): Promise<{ success: boolean; url?: string; error?: string }> {
+    try {
+      const ext = file.name.split('.').pop()?.toLowerCase() || 'png';
+      const storagePathSpaced = `logo/logo alcaldia.${ext}`;
+
+      // Subir archivo único al bucket 'anexos' dentro de la carpeta 'logo/'
+      const { data: uploadData, error: uploadErr } = await supabase
+        .storage
+        .from('anexos')
+        .upload(storagePathSpaced, file, { upsert: true, contentType: file.type || 'image/png' });
+
+      if (uploadErr) {
+        console.error('Error subiendo logo a Supabase Storage anexos/logo:', uploadErr);
+        return { success: false, error: uploadErr.message || 'Error al subir la imagen al bucket' };
+      }
+
+      const { data: publicUrlData } = supabase.storage.from('anexos').getPublicUrl(storagePathSpaced);
+      let logoUrl = publicUrlData?.publicUrl || '';
+      if (logoUrl) {
+        logoUrl = `${logoUrl}?t=${Date.now()}`;
+      }
+
+      if (typeof localStorage !== 'undefined' && logoUrl) {
+        localStorage.setItem('alcaldia_quibdo_custom_logo_url', logoUrl);
+      }
+
+      // Guardar también la URL en la tabla configuracion_ia si existe
+      try {
+        await supabase
+          .from('configuracion_ia')
+          .upsert({ id: 'global_config', logo_url: logoUrl, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+      } catch (e) {}
+
+      if (typeof window !== 'undefined' && logoUrl) {
+        window.dispatchEvent(new CustomEvent('logo_alcaldia_actualizado', { detail: { url: logoUrl } }));
+      }
+
+      return { success: true, url: logoUrl };
+    } catch (err: any) {
+      console.error('Error en uploadLogoAlcaldia:', err);
+      return { success: false, error: err?.message || 'Error al procesar la subida del logo' };
+    }
+  },
+
+  async deleteLogoAlcaldia(): Promise<{ success: boolean; error?: string }> {
+    try {
+      // 1. Listar y eliminar todos los archivos dentro de la carpeta 'logo' en el bucket 'anexos'
+      const { data: files } = await supabase.storage.from('anexos').list('logo');
+      if (files && files.length > 0) {
+        const pathsToRemove = files
+          .filter(f => f.name && !f.name.startsWith('.'))
+          .map(f => `logo/${f.name}`);
+
+        if (pathsToRemove.length > 0) {
+          await supabase.storage.from('anexos').remove(pathsToRemove);
+        }
+      }
+
+      // También intentar eliminar rutas conocidas directamente
+      await supabase.storage.from('anexos').remove([
+        'logo/logo alcaldia.png',
+        'logo/logo_alcaldia.png',
+        'logo/logo.png',
+        'logo_alcaldia.png',
+        'logo.png'
+      ]).catch(() => {});
+
+      // 2. Limpiar preferencia local
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem('alcaldia_quibdo_custom_logo_url');
+      }
+
+      // 3. Limpiar en la tabla configuracion_ia si aplica
+      try {
+        await supabase
+          .from('configuracion_ia')
+          .update({ logo_url: null, updated_at: new Date().toISOString() })
+          .eq('id', 'global_config');
+      } catch (e) {}
+
+      // 4. Disparar evento para restaurar el logo/escudo por defecto
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('logo_alcaldia_actualizado', { detail: { url: '' } }));
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      console.error('Error en deleteLogoAlcaldia:', err);
+      return { success: false, error: err?.message || 'Error al eliminar el logo' };
+    }
+  },
+
+  // 27. Módulo de Gestión del Membrete / Fondo Institucional (Supabase Storage: anexos/membretes/membrete_alcaldia.png)
+  async uploadMembreteAlcaldia(file: File): Promise<{ success: boolean; url?: string; error?: string }> {
+    try {
+      const ext = file.name.split('.').pop()?.toLowerCase() || 'png';
+      const storagePath = `membretes/membrete_alcaldia.${ext}`;
+
+      // Subir archivo al bucket 'anexos' dentro de la carpeta 'membretes/'
+      const { data: uploadData, error: uploadErr } = await supabase
+        .storage
+        .from('anexos')
+        .upload(storagePath, file, { upsert: true, contentType: file.type || 'image/png' });
+
+      if (uploadErr) {
+        console.error('Error subiendo membrete a Supabase Storage anexos/membretes:', uploadErr);
+        return { success: false, error: uploadErr.message || 'Error al subir la imagen al bucket' };
+      }
+
+      const { data: publicUrlData } = supabase.storage.from('anexos').getPublicUrl(storagePath);
+      let membreteUrl = publicUrlData?.publicUrl || '';
+      if (membreteUrl) {
+        membreteUrl = `${membreteUrl}?t=${Date.now()}`;
+      }
+
+      if (typeof localStorage !== 'undefined' && membreteUrl) {
+        localStorage.setItem('alcaldia_quibdo_custom_membrete_url', membreteUrl);
+      }
+
+      // Guardar también en la tabla configuracion_ia si existe
+      try {
+        await supabase
+          .from('configuracion_ia')
+          .upsert({ id: 'global_config', membrete_url: membreteUrl, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+      } catch (e) {}
+
+      if (typeof window !== 'undefined' && membreteUrl) {
+        window.dispatchEvent(new CustomEvent('membrete_alcaldia_actualizado', { detail: { url: membreteUrl } }));
+      }
+
+      return { success: true, url: membreteUrl };
+    } catch (err: any) {
+      console.error('Error en uploadMembreteAlcaldia:', err);
+      return { success: false, error: err?.message || 'Error al procesar la subida del membrete' };
+    }
+  },
+
+  async deleteMembreteAlcaldia(): Promise<{ success: boolean; error?: string }> {
+    try {
+      // 1. Listar y eliminar todos los archivos dentro de la carpeta 'membretes' en el bucket 'anexos'
+      const { data: files } = await supabase.storage.from('anexos').list('membretes');
+      if (files && files.length > 0) {
+        const pathsToRemove = files
+          .filter(f => f.name && !f.name.startsWith('.'))
+          .map(f => `membretes/${f.name}`);
+
+        if (pathsToRemove.length > 0) {
+          await supabase.storage.from('anexos').remove(pathsToRemove);
+        }
+      }
+
+      // 2. Limpiar preferencia local
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem('alcaldia_quibdo_custom_membrete_url');
+      }
+
+      // 3. Limpiar en la tabla configuracion_ia si aplica
+      try {
+        await supabase
+          .from('configuracion_ia')
+          .update({ membrete_url: null, updated_at: new Date().toISOString() })
+          .eq('id', 'global_config');
+      } catch (e) {}
+
+      // 4. Disparar evento para notificar que se eliminó el membrete
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('membrete_alcaldia_actualizado', { detail: { url: '' } }));
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      console.error('Error en deleteMembreteAlcaldia:', err);
+      return { success: false, error: err?.message || 'Error al eliminar el membrete' };
+    }
+  },
+
+  async getGlobalMembreteUrl(): Promise<string | null> {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const custom = localStorage.getItem('alcaldia_quibdo_custom_membrete_url');
+        if (custom) return custom;
+      }
+
+      const { data: files } = await supabase.storage.from('anexos').list('membretes');
+      if (files && files.length > 0) {
+        const valid = files.filter(f => !f.name.startsWith('.'));
+        if (valid.length > 0) {
+          const { data: pUrl } = supabase.storage.from('anexos').getPublicUrl(`membretes/${valid[0].name}`);
+          if (pUrl?.publicUrl) return `${pUrl.publicUrl}?t=${Date.now()}`;
+        }
+      }
+    } catch (e) {}
+
+    return null;
+  }
+};
+
+export interface SecretariaDocumento {
+  id: string;
+  secretariaId?: string;
+  nombre: string;
+  categoria?: string;
+  descripcion?: string;
+  fileName: string;
+  fileSize: number;
+  mimeType: string;
+  fileUrl: string;
+  storagePath?: string;
+  fechaSubida: string;
+  subidoPorNombre?: string;
+  subidoPorDocumento?: string;
+}

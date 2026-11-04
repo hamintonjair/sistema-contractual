@@ -1,0 +1,6 @@
+{
+  "name": "Plataforma de Informes Contractuales",
+  "description": "Plataforma para la gestion y generacion de informes de actividades contractuales por secretarias.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

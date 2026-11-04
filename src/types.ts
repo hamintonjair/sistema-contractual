@@ -1,0 +1,1102 @@
+import { extraerLetrasYNumeroDeValorPagar, formatearObjetoConPeriodo, formatFechaAnioMesDia, formatFechaFiduciaria, obtenerValoresMonetariosReporte } from './utils/numberToWords';
+import { parsePlazoComponents, formatFechaDeclaracionRenta } from './utils/formatters';
+
+export const extractContratoNroOnly = (str?: string): string => {
+  if (!str) return '';
+  const clean = str.trim();
+  const firstPart = clean.split(/[\s\-\/]+/)[0];
+  return firstPart.replace(/\D/g, '');
+};
+
+export interface ContractNumberAndYear {
+  numero: string;
+  ano: string;
+  full: string;
+  labelContratoDe: string;
+}
+
+export const parseContractNumberAndYear = (
+  rawStr?: string,
+  user?: AuthUser,
+  reports?: ReportData[],
+  defaultYear = '2026'
+): ContractNumberAndYear => {
+  let numero = '';
+  let ano = defaultYear;
+
+  const rep = (reports && reports.length > 0)
+    ? (reports.find(r => r.contratoNro && r.contratoNro.trim() !== '') || reports[0])
+    : null;
+
+  const extractDigits = (str?: string) => {
+    if (!str) return '';
+    let s = str.trim();
+    // Eliminar duplicaciones anormales de años como 20262026 o 2026 2026
+    s = s.replace(/20\d{2}20\d{2}/g, '').replace(/20\d{2}\s+20\d{2}/g, '');
+
+    // Buscar "X de YYYY" o "CPS X de YYYY" o "Contrato Nº X DE YYYY"
+    const matchDe = s.match(/(?:CPS|CONTRATO|N[°º\.]*)?\s*([a-zA-Z0-9_-]+)\s+DE\s+(20\d{2})/i);
+    if (matchDe && matchDe[1] && !/^20\d{2}$/.test(matchDe[1])) {
+      const d = matchDe[1].replace(/\D/g, '');
+      if (d && !/^20\d{2}$/.test(d)) return d;
+    }
+
+    // Buscar "Nº X" o "N° X" o "CPS X"
+    const matchNro = s.match(/(?:CPS|CONTRATO|N[°º\.]*)\s*(\d+)/i);
+    if (matchNro && matchNro[1] && !/^20\d{2}$/.test(matchNro[1])) {
+      return matchNro[1];
+    }
+
+    // Limpiar el año de 4 dígitos al final si viene en formato "DE 2026"
+    const cleanWithoutYear = s.replace(/\s*(?:DE|de|\/|-)?\s*20\d{2}\b/gi, '').trim();
+
+    // Extraer solo dígitos de lo que queda
+    const digitsOnly = cleanWithoutYear.replace(/\D/g, '');
+    if (digitsOnly && !/^20\d{2}$/.test(digitsOnly) && !/^20\d{2}20\d{2}$/.test(digitsOnly)) {
+      return digitsOnly;
+    }
+    return '';
+  };
+
+  const rawNum = extractDigits(rawStr);
+  const userNum = extractDigits(user?.contratoNro);
+  const repNum = extractDigits(rep?.contratoNro);
+
+  // Prioridad: Usar el número extraído de mayor fiabilidad del contratista en la base de datos
+  if (user?.role === 'contratista' && userNum) {
+    numero = userNum;
+  } else if (rawNum) {
+    numero = rawNum;
+  } else if (userNum) {
+    numero = userNum;
+  } else if (repNum) {
+    numero = repNum;
+  } else {
+    // Ultimo recurso: nunca aceptar una etiqueta ya formateada ("CPS 015 de 2026",
+    // "Contrato N 015 DE 2026"). Si se aceptara, al volver a formatearla se
+    // duplicarian los prefijos y el anio ("CPS CPS 2026 de 2026 de 2026").
+    const esEtiquetaFormateada = (v: string) => {
+      const t = ' ' + v.toUpperCase() + ' ';
+      return t.includes('CPS') || t.includes('CONTRATO') ||
+        t.includes(' DE ') || t.includes('N°') || t.includes('Nº');
+    };
+    const candidato = [rawStr, user?.contratoNro, rep?.contratoNro]
+      .map(v => (v || '').trim())
+      .find(v => v !== '' && !/^20\d{2}$/.test(v) && !esEtiquetaFormateada(v));
+    numero = candidato ? candidato.replace(/[^0-9A-Za-z_-]/g, '') : '';
+  }
+
+  const combinedSource = `${user?.contratoNro || ''} ${rawStr || ''} ${rep?.contratoNro || ''} ${rep?.fechaInicio || ''} ${rep?.periodoHasta || ''} ${rep?.fechaPresentacion || ''}`;
+  const yearMatch = combinedSource.match(/\b(20\d{2})\b/);
+  if (yearMatch) {
+    ano = yearMatch[1];
+  }
+
+  const full = numero ? `CPS ${numero} de ${ano}` : `CPS de ${ano}`;
+  const labelContratoDe = numero ? `Contrato Nº ${numero} DE ${ano}` : `Contrato DE ${ano}`;
+
+  return {
+    numero,
+    ano,
+    full,
+    labelContratoDe
+  };
+};
+
+export type UserRole = 'super_admin' | 'secretaria_admin' | 'secretaria_supervisor' | 'contratista';
+
+export type EstadoInforme = 'Borrador' | 'Enviado' | 'Aprobado' | 'Rechazado' | 'Devuelto';
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  password?: string;
+  nombreCompleto: string;
+  documentoIdentidad: string;
+  role: UserRole;
+  secretariaId?: string;
+  secretariaNombre?: string;
+  secretariaCodigo?: string;
+  cargo?: string;
+  telefono?: string;
+  contratoNro?: string;
+  objetoContrato?: string;
+  valorContrato?: string;
+  valorMensual?: string;
+  cdpNro?: string;
+  crpNro?: string;
+  polizaNro?: string;
+  fechaPoliza?: string;
+  plazo?: string;
+  fechaInicio?: string;
+  fechaTerminacion?: string;
+  supervisorNombre?: string;
+  supervisorCargo?: string;
+  supervisorDocumento?: string;
+  apoyoSupervisionNombre?: string;
+  apoyoSupervisionDocumento?: string;
+  numeroCuenta?: string;
+  banco?: string;
+  tipoCuenta?: string;
+  ciudad?: string;
+  ciudadCuenta?: string;
+  barrio?: string;
+  direccion?: string;
+  fechaRegistroPresupuestal?: string;
+  codigoRubro?: string;
+  createdAt?: string;
+  isSyncedToDb?: boolean;
+}
+
+export const DEMO_USERS: AuthUser[] = [
+  {
+    id: 'usr-contratista-01',
+    email: 'carlos.palacios@quibdo-ejemplo.gov.co',
+    password: 'Contratista2026*',
+    nombreCompleto: 'CARLOS ANDRÉS PALACIOS CÓRDOBA',
+    documentoIdentidad: '1077456123',
+    role: 'contratista',
+    secretariaId: 'sec-inclusion-170',
+    secretariaNombre: 'Secretaría de Inclusión y Cohesión Social',
+    secretariaCodigo: '170',
+    cargo: 'Contratista de Prestación de Servicios de Apoyo a la Gestión',
+    telefono: '3104567890',
+    contratoNro: '',
+    objetoContrato: 'PRESTAR LOS SERVICIOS PROFESIONALES DE APOYO A LA GESTIÓN EN EL ÁREA DE SISTEMAS Y TECNOLOGÍAS DE LA INFORMACIÓN...',
+    valorContrato: '$25.000.000',
+    cdpNro: '2026-00125',
+    crpNro: '2026-00189',
+    polizaNro: 'POL-998877',
+    fechaInicio: '16/01/2026',
+    fechaTerminacion: '15/07/2026',
+    supervisorNombre: 'DIANA ANDREA MOSQUERA GARCIA',
+    supervisorDocumento: '35.602.521',
+    apoyoSupervisionNombre: 'YICELA BEJARANO CORDOBA',
+    apoyoSupervisionDocumento: '1.077.441.597',
+    numeroCuenta: '',
+    banco: '',
+    tipoCuenta: 'AHORRO',
+    ciudad: '',
+    barrio: '',
+    direccion: '',
+    fechaRegistroPresupuestal: '',
+    codigoRubro: '',
+  },
+  {
+    id: 'usr-admin-sec-01',
+    email: 'inclusion@quibdo-choco.gov.co',
+    password: 'Inclusion2026*',
+    nombreCompleto: 'DIANA ANDREA MOSQUERA GARCIA',
+    documentoIdentidad: '35.602.521',
+    role: 'secretaria_admin',
+    secretariaId: 'sec-inclusion-170',
+    secretariaNombre: 'Secretaría de Inclusión y Cohesión Social',
+    secretariaCodigo: '170',
+    cargo: 'Secretaria de Despacho / Supervisora',
+    telefono: '3100000000',
+  },
+  {
+    id: 'usr-superadmin-01',
+    email: 'alcaldia@quibdo-choco.gov.co',
+    password: 'Quibdo2026*',
+    nombreCompleto: 'SUPER ADMINISTRADOR MUNICIPAL',
+    documentoIdentidad: '891680011-0',
+    role: 'super_admin',
+    cargo: 'Administrador General de Plataforma Alcaldía de Quibdó',
+  }
+];
+
+export interface Secretaria {
+  id: string;
+  nombre: string;
+  nit: string;
+  codigo: string;
+  banner_url?: string;
+  created_at?: string;
+}
+
+export interface Profile {
+  id: string;
+  role: UserRole;
+  secretaria_id?: string;
+  nombre_completo: string;
+  documento_identidad: string;
+  telefono: string;
+  correo?: string;
+  created_at?: string;
+}
+
+export interface Contrato {
+  id: string;
+  contratista_id: string;
+  secretaria_id: string;
+  contrato_nro: string;
+  objeto: string;
+  valor_contrato: number | string;
+  cdp_nro: string;
+  crp_nro: string;
+  poliza_nro: string;
+  fecha_aprobacion_poliza: string;
+  plazo_meses: number | string;
+  fecha_inicio: string;
+  fecha_terminacion: string;
+  supervisor_nombre: string;
+  supervisor_documento: string;
+  apoyo_supervision_nombre: string;
+  apoyo_supervision_documento: string;
+  numero_cuenta?: string;
+  banco?: string;
+  tipo_cuenta?: string;
+  ciudad_cuenta?: string;
+  fecha_registro_presupuestal?: string;
+  codigo_rubro?: string;
+  created_at?: string;
+}
+
+export interface Notificacion {
+  id: string;
+  user_id: string;
+  mensaje: string;
+  tipo: 'aprobacion' | 'devolucion' | 'radicado' | 'info' | 'sistema';
+  leida: boolean;
+  created_at?: string;
+  informe_nro?: string;
+  report_id?: string;
+  titulo?: string;
+}
+
+export interface Obligacion {
+  id: string;
+  num?: number | string;
+  descripcion: string;
+  actividades: string;
+  soportes: string;
+  fotos?: Anexo[];
+  isUpdated?: boolean;
+  isTouched?: boolean;
+  isClonedStructure?: boolean;
+}
+
+export interface Anexo {
+  id: string;
+  titulo: string;
+  imagenUrl: string;
+  file?: File;
+  isPendingUpload?: boolean;
+  obligacionId?: string;
+  obligacionIndex?: number;
+  isUpdated?: boolean;
+}
+
+export interface FieldComment {
+  fieldId?: string;
+  fieldName?: string;
+  campoId?: string;
+  nombreCampo?: string;
+  comentario: string;
+  autor?: string;
+  fecha?: string;
+  resuelto?: boolean;
+  corregido?: boolean;
+  fechaCorreccion?: string;
+}
+
+export interface ReportData {
+  id?: string;
+  contratoId?: string;
+  secretariaId?: string;
+  secretariaNombre?: string;
+  secretariaCodigo?: string;
+  secretariaNit?: string;
+  estado?: EstadoInforme;
+  syncedToDb?: boolean;
+  watermarkImage?: string;
+  nitAlcaldia?: string;
+  isUpdated?: boolean;
+  isTouched?: boolean;
+  isClonedFromPrevious?: boolean;
+  touchedFields?: Record<string, boolean>;
+  updatedFields?: Record<string, boolean>;
+  
+  fechaAplicacion: string;
+  tipoInforme: 'Mensual' | 'Final';
+  informeNro: string;
+  fechaPresentacion: string;
+  periodoDesde: string;
+  periodoHasta: string;
+  contratistaNombre: string;
+  contratistaDocumento: string;
+  contratistaLugarDoc?: string;
+  contratistaCorreo: string;
+  contratistaTelefono: string;
+  supervisorNombre: string;
+  supervisorCargo?: string;
+  supervisorDocumento: string;
+  apoyoSupervisionNombre: string;
+  apoyoSupervisionDocumento: string;
+  valorContrato: string;
+  valorMensual?: string;
+  valorAdicion: string;
+  contratoNro: string;
+  objeto: string;
+  cdpNro: string;
+  crpNro: string;
+  polizaNro: string;
+  fechaPoliza: string;
+  plazo: string;
+  fechaInicio: string;
+  fechaTerminacion: string;
+  modificaciones: string;
+  obligaciones: Obligacion[];
+  observaciones: string;
+  rawObservacionesDb?: string;
+  anexos: Anexo[];
+  valorPagar: string;
+  valorPagarCertificado?: string | number;
+  comentariosCampos?: Record<string, FieldComment>;
+  numeroCuenta?: string;
+  banco?: string;
+  tipoCuenta?: string;
+  ciudad?: string;
+  ciudadCuenta?: string;
+  barrio?: string;
+  direccion?: string;
+  contratistaDireccion?: string;
+  fechaRegistroPresupuestal?: string;
+  codigoRubro?: string;
+  saludValor?: string;
+  saludEps?: string;
+  saludPlanilla?: string;
+  pensionValor?: string;
+  pensionFondo?: string;
+  pensionPlanilla?: string;
+  arpValor?: string;
+  arpAseguradora?: string;
+  arpPlanilla?: string;
+  resaltarSeguridadSocial?: boolean;
+  firmaUrl?: string;
+  firmaContratistaUrl?: string;
+  firmaSupervisorUrl?: string;
+}
+
+import { getDatosLiquidacionPeriodo, limpiarNumeroMoneda } from './utils/paymentPlanUtils';
+import { formatDateSlash, quitarDecimales } from './utils/formatters';
+
+export interface CertificadoSupervisionData {
+  id?: string;
+  reportId?: string;
+  informeNro: string;
+  contratistaNombre: string;
+  tipoContrato: string;
+  contratoNro: string;
+  contratoAno: string;
+  tipoDocumento: string;
+  contratistaDocumento: string;
+  supervisorNombre: string;
+  supervisorCargo: string;
+  objeto: string;
+  
+  clausulaNro: string;
+  
+  numeroCuenta: string;
+  banco: string;
+  tipoCuenta: string;
+  fechaInicio: string;
+  plazoMeses: string;
+  plazoDias: string;
+  fechaTerminacion: string;
+  valorInicial: string;
+  adicion1: string;
+  adicion2: string;
+  adicion3: string;
+  valorTotal: string;
+  prorroga1Dias: string;
+  prorroga2Dias: string;
+  prorroga3Dias: string;
+
+  cdpNro: string;
+  crpNro: string;
+  fechaRegistroPresupuestal: string;
+  codigoRubro: string;
+  valorRubro: string;
+
+  cdpNro2?: string;
+  crpNro2?: string;
+  fechaRegistroPresupuestal2?: string;
+  codigoRubro2?: string;
+  valorRubro2?: string;
+
+  cdpNro3?: string;
+  crpNro3?: string;
+  fechaRegistroPresupuestal3?: string;
+  codigoRubro3?: string;
+  valorRubro3?: string;
+
+  cdpNro4?: string;
+  crpNro4?: string;
+  fechaRegistroPresupuestal4?: string;
+  codigoRubro4?: string;
+  valorRubro4?: string;
+
+  cdpNro5?: string;
+  crpNro5?: string;
+  fechaRegistroPresupuestal5?: string;
+  codigoRubro5?: string;
+  valorRubro5?: string;
+
+  saludValor: string;
+  saludEps: string;
+  saludPlanilla: string;
+  pensionValor: string;
+  pensionFondo: string;
+  pensionPlanilla: string;
+  arpValor: string;
+  arpAseguradora: string;
+  arpPlanilla: string;
+  resaltarSeguridadSocial?: boolean;
+
+  pagoNro: string;
+  periodoDesde: string;
+  periodoHasta: string;
+  porcentajeEjecucion: string;
+  valorPagadoAcumulado: string;
+  valorAPagarSinIva: string;
+  iva: string;
+  valorTotalAPagar: string;
+  saldoPorPagar: string;
+  observacionesLiquidacion?: string;
+
+  valorAvalado: string;
+  expedicionDia: string;
+  expedicionMes: string;
+  expedicionAno: string;
+  supervisorFirma?: string;
+}
+
+export const createDefaultCertificadoData = (report?: ReportData): CertificadoSupervisionData => {
+  const rep = report || initialMockData;
+  const { valorNumeroFormateado } = extraerLetrasYNumeroDeValorPagar(rep.valorPagar);
+  const valorNumStr = valorNumeroFormateado || '2.160.000';
+
+  // Cálculo automático del plan financiero y liquidación de pago si hay datos contractuales
+  let autoLiq: any = null;
+  const numValTotal = limpiarNumeroMoneda(rep.valorContrato || '$ 20.029.800');
+  const fInicio = rep.fechaInicio || '14/01/2026';
+  const fFin = rep.fechaTerminacion || '14/07/2026';
+
+  if (numValTotal > 0 && fInicio && fFin) {
+    const valMensual = rep.valorMensual ? limpiarNumeroMoneda(rep.valorMensual) : undefined;
+    autoLiq = getDatosLiquidacionPeriodo({
+      valor_total_contrato: numValTotal,
+      valor_mensual: valMensual,
+      fecha_inicio: fInicio,
+      fecha_fin: fFin,
+    }, rep.informeNro || '1', rep.periodoDesde, rep.periodoHasta);
+  }
+
+  const pagoNroCalculado = autoLiq?.pagoNro || rep.informeNro || '1';
+  const periodoDesdeCalculado = autoLiq?.periodoDesde || (rep.periodoDesde ? formatDateSlash(rep.periodoDesde) : '14/01/2026');
+  const periodoHastaCalculado = autoLiq?.periodoHasta || (rep.periodoHasta ? formatDateSlash(rep.periodoHasta) : '31/01/2026');
+  const porcentajeEjecucionCalculado = autoLiq?.porcentajeEjecucion || '8,89 %';
+  const valorPagadoAcumuladoCalculado = quitarDecimales(autoLiq?.valorPagadoAcumulado || '0');
+  const valorAPagarSinIvaCalculado = valorNumStr || quitarDecimales(autoLiq?.valorAPagarSinIva || '2.160.000');
+  const valorTotalAPagarCalculado = valorNumStr || quitarDecimales(autoLiq?.valorTotalAPagar || '2.160.000');
+  const saldoPorPagarCalculado = quitarDecimales(autoLiq?.saldoPorPagar || '18.249.373');
+
+  const MONTH_NAMES = [
+    'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+  ];
+
+  let mesCalculado = 'agosto';
+  let diaCalculado = '31';
+  let anoCalculado = '2026';
+
+  const targetDateStr = rep.fechaPresentacion || rep.periodoHasta || periodoHastaCalculado;
+  if (targetDateStr) {
+    const cleanStr = targetDateStr.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(cleanStr)) {
+      const [y, m, d] = cleanStr.split('-');
+      anoCalculado = y;
+      const mIdx = parseInt(m, 10) - 1;
+      if (mIdx >= 0 && mIdx < 12) mesCalculado = MONTH_NAMES[mIdx];
+      diaCalculado = String(parseInt(d, 10));
+    } else if (/^\d{1,2}[/-]\d{1,2}[/-]\d{4}$/.test(cleanStr)) {
+      const [d, m, y] = cleanStr.split(/[/-]/);
+      anoCalculado = y;
+      const mIdx = parseInt(m, 10) - 1;
+      if (mIdx >= 0 && mIdx < 12) mesCalculado = MONTH_NAMES[mIdx];
+      diaCalculado = String(parseInt(d, 10));
+    }
+  } else if (rep.fechaAplicacion) {
+    const appLower = rep.fechaAplicacion.trim().toLowerCase();
+    for (const mName of MONTH_NAMES) {
+      if (appLower.includes(mName)) {
+        mesCalculado = mName;
+        break;
+      }
+    }
+    const yearMatch = appLower.match(/\b(20\d{2})\b/);
+    if (yearMatch) anoCalculado = yearMatch[1];
+  }
+
+  let rawContrato = rep.contratoNro || '';
+  let contratoNumOnly = extractContratoNroOnly(rawContrato) || '';
+  let contratoYear = '2026';
+  if (rawContrato.includes('-')) {
+    const parts = rawContrato.split('-');
+    if (parts[1] && parts[1].trim().length === 4) contratoYear = parts[1].trim();
+  } else if (rawContrato.includes('/')) {
+    const parts = rawContrato.split('/');
+    if (parts[1] && parts[1].trim().length === 4) contratoYear = parts[1].trim();
+  }
+
+  const plazoParsed = parsePlazoComponents(rep.plazo);
+
+  return {
+    reportId: rep.id,
+    informeNro: rep.informeNro || '1',
+    contratistaNombre: rep.contratistaNombre || '',
+    tipoContrato: 'PRESTACION DE SERVICIOS',
+    contratoNro: contratoNumOnly,
+    contratoAno: contratoYear,
+    tipoDocumento: 'C.C.',
+    contratistaDocumento: rep.contratistaDocumento || '',
+    supervisorNombre: rep.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA',
+    supervisorCargo: 'Secretaria de Inclusión y Cohesión Social',
+    objeto: rep.objeto || '',
+    
+    clausulaNro: '6',
+    
+    numeroCuenta: rep?.numeroCuenta || '',
+    banco: rep?.banco || '',
+    tipoCuenta: rep?.tipoCuenta || 'AHORRO',
+    fechaInicio: rep.fechaInicio || '',
+    plazoMeses: String(plazoParsed.meses !== undefined ? plazoParsed.meses : 6),
+    plazoDias: String(plazoParsed.dias !== undefined ? plazoParsed.dias : 0),
+    fechaTerminacion: rep.fechaTerminacion || '',
+    valorInicial: rep.valorContrato || '',
+    adicion1: '-',
+    adicion2: '-',
+    adicion3: '-',
+    valorTotal: rep.valorContrato || '',
+    prorroga1Dias: '',
+    prorroga2Dias: '',
+    prorroga3Dias: '',
+
+    cdpNro: rep.cdpNro || '',
+    crpNro: rep.crpNro || '',
+    fechaRegistroPresupuestal: rep?.fechaRegistroPresupuestal ? formatDateSlash(rep.fechaRegistroPresupuestal) : '',
+    codigoRubro: rep?.codigoRubro || '',
+    valorRubro: valorAPagarSinIvaCalculado,
+
+    cdpNro2: '',
+    crpNro2: '',
+    fechaRegistroPresupuestal2: '',
+    codigoRubro2: '',
+    valorRubro2: '',
+
+    cdpNro3: '',
+    crpNro3: '',
+    fechaRegistroPresupuestal3: '',
+    codigoRubro3: '',
+    valorRubro3: '',
+
+    cdpNro4: '',
+    crpNro4: '',
+    fechaRegistroPresupuestal4: '',
+    codigoRubro4: '',
+    valorRubro4: '',
+
+    cdpNro5: '',
+    crpNro5: '',
+    fechaRegistroPresupuestal5: '',
+    codigoRubro5: '',
+    valorRubro5: '',
+
+    saludValor: rep?.saludValor || '',
+    saludEps: rep?.saludEps || '',
+    saludPlanilla: rep?.saludPlanilla || '',
+    pensionValor: rep?.pensionValor || '',
+    pensionFondo: rep?.pensionFondo || '',
+    pensionPlanilla: rep?.pensionPlanilla || '',
+    arpValor: rep?.arpValor || '',
+    arpAseguradora: rep?.arpAseguradora || '',
+    arpPlanilla: rep?.arpPlanilla || '',
+    resaltarSeguridadSocial: rep?.resaltarSeguridadSocial !== undefined ? rep.resaltarSeguridadSocial : true,
+
+    pagoNro: pagoNroCalculado,
+    periodoDesde: periodoDesdeCalculado,
+    periodoHasta: periodoHastaCalculado,
+    porcentajeEjecucion: porcentajeEjecucionCalculado,
+    valorPagadoAcumulado: valorPagadoAcumuladoCalculado,
+    valorAPagarSinIva: valorAPagarSinIvaCalculado,
+    iva: '-',
+    valorTotalAPagar: valorTotalAPagarCalculado,
+    saldoPorPagar: saldoPorPagarCalculado,
+    observacionesLiquidacion: '',
+
+    valorAvalado: `$ ${valorTotalAPagarCalculado}`,
+    expedicionDia: diaCalculado,
+    expedicionMes: mesCalculado,
+    expedicionAno: anoCalculado,
+    supervisorFirma: '',
+  };
+};
+
+export interface InformeSummary {
+  id: string;
+  contrato_id: string;
+  informe_nro: number | string;
+  tipo_informe: 'Mensual' | 'Final';
+  fecha_aplicacion?: string;
+  fecha_presentacion: string;
+  periodo_desde: string;
+  periodo_hasta: string;
+  estado: EstadoInforme;
+  contratista_nombre: string;
+  contratista_documento: string;
+  contrato_nro: string;
+  secretaria_nombre: string;
+  created_at: string;
+  comentariosCampos?: Record<string, FieldComment>;
+}
+
+export const initialMockData: ReportData = {
+  secretariaNombre: 'SECRETARÍA DE INCLUSIÓN Y COHESIÓN SOCIAL',
+  secretariaCodigo: '170',
+  secretariaNit: '891680011-0',
+  fechaAplicacion: 'JULIO DE 2026',
+  tipoInforme: 'Mensual',
+  informeNro: '6',
+  fechaPresentacion: '15/07/2026',
+  periodoDesde: '01/07/2026',
+  periodoHasta: '15/07/2026',
+  contratistaNombre: 'CARLOS ANDRÉS PALACIOS CÓRDOBA',
+  contratistaDocumento: '1077456123',
+  contratistaCorreo: 'carlos.palacios@quibdo-ejemplo.gov.co',
+  contratistaTelefono: '3104567890',
+  supervisorNombre: 'DIANA ANDREA MOSQUERA GARCIA',
+  supervisorDocumento: '35.602.521',
+  apoyoSupervisionNombre: 'N/A',
+  apoyoSupervisionDocumento: 'N/A',
+  valorContrato: '$ 20.029.800',
+  valorMensual: '$ 3.338.300',
+  valorAdicion: '$ N/A',
+  contratoNro: '',
+  objeto: 'PRESTAR LOS SERVICIOS PROFESIONALES EN EL AREA DE SISTEMAS PARA ADELANTAR, ACOMPAÑAR Y DESARROLLAR LAS ACCIONES QUE SE LLEVAN ACABO EN LA SECRETARIA DE INCLUSIÓN Y COHESIÓN SOCIAL DEL MUNICIPIO DE QUIBDÓ PARA LA POBLACIÓN BENEFICIARIA.',
+  cdpNro: '137',
+  crpNro: '191',
+  polizaNro: 'N/A',
+  fechaPoliza: 'N/A',
+  plazo: 'SEIS(6) MESES',
+  fechaInicio: '14/01/2026',
+  fechaTerminacion: '14/07/2026',
+  modificaciones: 'N/A',
+  obligaciones: [
+    {
+      id: '1',
+      descripcion: '1. Diseñar, implementar y actualizar una base de datos que permita registrar y gestionar información sobre la población beneficiaria de los programas de inclusión y cohesión social.',
+      actividades: 'En el periodo anterior se realizó la actualización constante de la base de datos institucional mediante el software Red Inclusión, asegurando el registro y control oportuno del personal atendido. Este proceso permitió consolidar y organizar la información de manera confiable, fortaleciendo la centralización de los datos y la transparencia en la gestión operativa. A su vez, se garantizó la disponibilidad de insumos técnicos esenciales para el seguimiento, el análisis y el soporte en la toma de decisiones estratégicas orientadas al bienestar de la población beneficiaria.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '2',
+      descripcion: '2. Entregar un cronograma de las actividades mensuales que se pretenden desarrollar.',
+      actividades: 'Se presentó y envió al correo de contratista el cronograma mensual de actividades previstas para desarrollar en la Secretaría de Inclusión y Cohesión Social, el cual constituye una herramienta de planificación y seguimiento que permite organizar las acciones, distribuir responsabilidades y garantizar el cumplimiento oportuno de los objetivos establecidos durante el periodo de ejecución.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '3',
+      descripcion: '3. Consolidar, recopilar y manejar todas las actas, listados y acciones que se realicen en la secretaría de inclusión y cohesión social, las cuales deben de estar actualizadas en una carpeta en la nube perteneciente a dicha dependencia.',
+      actividades: 'El repositorio institucional en Google Drive fue fortalecido mediante la clasificación y carga ordenada de actas, listados de asistencia y reportes de gestión. Gracias a este proceso se consolidó la documentación técnica relacionada con el cumplimiento de las actividades del plan de acción, asegurando que los archivos permanecieran organizados, actualizados y disponibles en el entorno digital. Esta labor permitió mejorar la gestión documental, afianzar el control administrativo y promover la transparencia en el manejo de la información institucional.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '4',
+      descripcion: '4. Entregar al finalizar el contrato una base de datos actualizada de la población migrante atendidas que se encuentran en el municipio.',
+      actividades: 'Se finalizó con el registro constante de información en la base de datos destinada a la caracterización de la población migrante y de los beneficiarios del municipio, tomando como referencia los datos recopilados en el periodo correspondiente. Este trabajo permitió fortalecer la calidad y actualización del sistema de información de la Secretaría de Inclusión y Cohesión Social, garantizando una base organizada, confiable y depurada al cierre del ciclo contractual. Asimismo, se mejoró la gestión institucional, la trazabilidad de los procesos y el soporte técnico requerido para la formulación y seguimiento de acciones estratégicas orientadas al bienestar de la población atendida.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '5',
+      descripcion: '5. Presentar de manera mensual un porcentaje de los avances y el personal atendido en la secretaría de inclusión y cohesión social.',
+      actividades: 'Se finalizó con la elaboración y entrega oportuna de los reportes semanales de gestión, en los cuales se evidenció de manera detallada el progreso de las actividades y los principales hitos alcanzados. Estos documentos integraron las acciones ejecutadas junto con la relación de participantes, respaldada en registros de asistencia debidamente verificados. La preparación de los informes se realizó conforme a los lineamientos técnicos establecidos, lo que permitió una presentación clara y estructurada que fortaleció la transparencia y la comunicación de los resultados obtenidos durante la ejecución contractual. Al cierre del periodo, la Secretaría de Inclusión y Cohesión Social registra un total de 3.306 usuarios vinculados a los diferentes programas institucionales.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '6',
+      descripcion: '6. Formar a los funcionarios de la Secretaría en el uso adecuado de las herramientas tecnológicas donde se les capacite de manera mensual en el uso y manejo de una estrategia tecnológica.',
+      actividades: 'Se impartió capacitación a la funcionaria sobre el uso adecuado de las herramientas ofimáticas, con el propósito de fortalecer sus conocimientos y aumentar la eficiencia en el manejo de aplicaciones como procesadores de texto, hojas de cálculo y presentaciones. Gracias a esta formación se optimizó el desarrollo de las tareas laborales, se redujeron los errores en el tratamiento de la información y se facilitó la elaboración de documentos y reportes institucionales.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '7',
+      descripcion: '7. Consolidar, recopilar y manejar todas las actas, listados y acciones que se realicen en la coordinación de juventudes, las cuales deben de estar actualizadas en una carpeta de la nube perteneciente a dicha dependencia.',
+      actividades: 'Se continuó con la gestión y actualización del repositorio digital de la Secretaría de Inclusión y Cohesión Social en Google Drive, a través de la organización y carga permanente de actas, listados de asistencia y documentos generados por la Coordinación de Juventudes. Esta labor aseguró que la información permaneciera centralizada, ordenada y disponible en la nube, lo que facilitó el acceso oportuno a los soportes y fortaleció los procesos de seguimiento, control administrativo y transparencia en la gestión institucional.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '8',
+      descripcion: '8. Proponer e implementar mejoras tecnológicas que optimicen la gestión y la prestación de servicios en la Secretaría.',
+      actividades: 'Se finalizó con las mejoras de la plataforma, logrando su migración de un entorno exclusivamente web hacia una aplicación móvil disponible en distintos dispositivos y perfeccionando su interfaz para ofrecer una experiencia más amigable. Al mismo tiempo, se reforzaron las medidas de seguridad y protección de la información mediante la implementación de controles de acceso y la configuración de respaldos automáticos. También se aplicaron mecanismos de verificación técnica orientados a garantizar la integridad, disponibilidad y confidencialidad de los datos, lo que redujo riesgos operativos y aseguró la estabilidad de los activos digitales institucionales durante el periodo reportado. Estas acciones permitieron optimizar la administración del software, fortalecer la transparencia en el manejo de la información y consolidar la confiabilidad de los procesos institucionales.',
+      soportes: 'Anexo fotográfico',
+    },
+    {
+      id: '9',
+      descripcion: '9. Las demás que asigne la administración, de acuerdo con el nivel, la naturaleza y el área de prestación del servicio, en el marco del objeto del contrato.',
+      actividades: 'Se finalizó con la reunión de articulación y preparación orientada a la creación de la ruta de atención integral para la población refugiada y migrante venezolana residente en el municipio de Quibdó. Este espacio permitió coordinar esfuerzos interinstitucionales, definir lineamientos estratégicos y establecer mecanismos de cooperación que servirán de base para garantizar una atención organizada, efectiva y ajustada a las necesidades de esta población.\n\nSe brindó acompañamiento inmediato a la comunidad del barrio Pablo Sexto tras la emergencia presentada, mediante la articulación del equipo de la Secretaría de Inclusión y Cohesión Social. La labor incluyó la presencia de personal uniformado en el territorio, la entrega de ayudas básicas disponibles, y la realización de actividades de contención psicosocial, charlas y acompañamiento a las familias afectadas.',
+      soportes: 'Anexo fotográfico',
+    }
+  ],
+  observaciones: '',
+  anexos: [],
+  valorPagar: 'UN MILLON QUINIENTOS CINCUENTA Y SIETE MIL OCHOCIENTOS SETENTA Y TRES PESOS M/CTE ($1.557.873)',
+  estado: 'Enviado'
+};
+
+export interface SoporteFiduciariaData {
+  id?: string;
+  reportId?: string;
+  docSoporteNro: string;
+  ciudad: string;
+  fecha: string;
+  nombresApellidos: string;
+  cedula: string;
+  direccion: string;
+  telefono: string;
+  sumaTotal: string;
+  valorLetras: string;
+  cantidad: string;
+  descripcionBienServicio: string;
+  subTotal: string;
+  total: string;
+  totalGeneral: string;
+  nota?: string;
+}
+
+export const createDefaultFiduciariaData = (report?: ReportData): SoporteFiduciariaData => {
+  const rep = report || initialMockData;
+  const { valorNumeroFormateado, sumaTotalConCentavos, valorLetras } = obtenerValoresMonetariosReporte(rep);
+  const fechaFiduciaria = formatFechaFiduciaria(rep);
+
+  return {
+    reportId: rep.id,
+    docSoporteNro: '',
+    ciudad: rep?.ciudad || rep?.ciudadCuenta || 'Quibdó',
+    fecha: fechaFiduciaria,
+    nombresApellidos: rep.contratistaNombre || 'Haminton Mena Mena',
+    cedula: rep.contratistaDocumento || '80.772.379',
+    direccion: rep?.direccion || rep?.barrio || rep?.contratistaDireccion || 'BARRIO BUENOS AIRES',
+    telefono: rep.contratistaTelefono || '3124943527',
+    sumaTotal: sumaTotalConCentavos,
+    valorLetras: valorLetras,
+    cantidad: '1',
+    descripcionBienServicio: rep.objeto || 'Prestar los servicios de apoyo a la gestión para adelantar, acompañar y desarrollar las acciones que se llevan acabo en la secretaria de inclusión y cohesión social del municipio de Quibdó.',
+    subTotal: valorNumeroFormateado,
+    total: valorNumeroFormateado,
+    totalGeneral: valorNumeroFormateado,
+    nota: 'RUT adjunto',
+  };
+};
+
+export interface DeclaracionRentaData {
+  id?: string;
+  reportId?: string;
+  fecha: string;
+  senores: string;
+  nombresApellidos: string;
+  cedula: string;
+  expedicionCedula: string;
+  aplicaRetencion: boolean;
+  firmaNombre: string;
+  firmaCedula: string;
+  firmaExpedicion: string;
+  firmaUrl?: string;
+}
+
+export const createDefaultDeclaracionRentaData = (report?: ReportData): DeclaracionRentaData => {
+  const rawDate = report?.periodoHasta || report?.fechaPresentacion || '2026-07-14';
+  const fechaFormatted = formatFechaDeclaracionRenta(rawDate);
+  const lugarDoc = report?.contratistaLugarDoc || 'Bogotá D.C';
+
+  return {
+    reportId: report?.id,
+    fecha: fechaFormatted,
+    senores: 'Señores\nALCALDIA\nCiudad.',
+    nombresApellidos: report?.contratistaNombre || 'HAMINTON MENA MENA',
+    cedula: report?.contratistaDocumento || '80.772.379',
+    expedicionCedula: lugarDoc,
+    aplicaRetencion: false,
+    firmaNombre: report?.contratistaNombre || 'HAMINTON MENA MENA',
+    firmaCedula: report?.contratistaDocumento || '80.772.379',
+    firmaExpedicion: lugarDoc,
+  };
+};
+
+export interface AutorizacionDesembolsoData {
+  id?: string;
+  reportId?: string;
+  fechaExpedicion: string;
+  consecutivoNro: string;
+  nombre: string;
+  nitCc: string;
+  nroCuenta: string;
+  tipoCuenta: string;
+  banco: string;
+  ciudad: string;
+  direccion: string;
+  telefono: string;
+  concepto?: string;
+  contratoNro?: string;
+  conceptoNro: string;
+  objeto: string;
+  valorNumeros: string;
+  subtotal: string;
+  ivaAsumido: string;
+  total: string;
+  valorLetras: string;
+  endoso1Beneficiario: string;
+  endoso1NitCc: string;
+  endoso1Cuenta: string;
+  endoso1Banco: string;
+  endoso1Tipo: string;
+  endoso1Concepto: string;
+  endoso1Valor: string;
+  endoso2Beneficiario: string;
+  endoso2NitCc: string;
+  endoso2Cuenta: string;
+  endoso2Banco: string;
+  endoso2Tipo: string;
+  endoso2Concepto: string;
+  endoso2Valor: string;
+  firmaUrl?: string;
+}
+
+export const createDefaultAutorizacionDesembolsoData = (report?: ReportData): AutorizacionDesembolsoData => {
+  const rep = report || initialMockData;
+  const { valorNumeroFormateado, valorLetras } = obtenerValoresMonetariosReporte(rep);
+  const objetoConPeriodo = formatearObjetoConPeriodo(
+    rep?.objeto,
+    rep?.fechaAplicacion,
+    rep?.fechaInicio,
+    rep?.fechaTerminacion,
+    rep?.fechaPresentacion,
+    rep?.periodoDesde,
+    rep?.periodoHasta
+  );
+
+  const rawExp = rep?.periodoHasta || rep?.fechaPresentacion || '2026-07-14';
+  const fechaExpedicion = formatFechaAnioMesDia(rawExp);
+
+  return {
+    reportId: rep?.id,
+    fechaExpedicion: fechaExpedicion,
+    consecutivoNro: rep?.informeNro || '1',
+    nombre: rep?.contratistaNombre || '',
+    nitCc: rep?.contratistaDocumento || '',
+    nroCuenta: rep?.numeroCuenta || '',
+    tipoCuenta: (rep?.tipoCuenta || 'AHORRO').toUpperCase(),
+    banco: (rep?.banco || '').toUpperCase(),
+    ciudad: (rep?.ciudad || rep?.ciudadCuenta || '').toUpperCase(),
+    direccion: (rep?.direccion || rep?.barrio || rep?.contratistaDireccion || '').toUpperCase(),
+    telefono: rep?.contratistaTelefono || '',
+    concepto: 'PRESTACION DE SERVICIOS',
+    contratoNro: rep?.contratoNro ? rep.contratoNro.trim().split(/[\s\-\/]+/)[0].replace(/\D/g, '') : '',
+    conceptoNro: rep?.contratoNro ? rep.contratoNro.trim().split(/[\s\-\/]+/)[0].replace(/\D/g, '') : '',
+    objeto: objetoConPeriodo,
+    valorNumeros: valorNumeroFormateado,
+    subtotal: valorNumeroFormateado,
+    ivaAsumido: '',
+    total: valorNumeroFormateado,
+    valorLetras: valorLetras,
+    endoso1Beneficiario: '',
+    endoso1NitCc: '',
+    endoso1Cuenta: '',
+    endoso1Banco: '',
+    endoso1Tipo: '',
+    endoso1Concepto: '',
+    endoso1Valor: '$ 0',
+    endoso2Beneficiario: '',
+    endoso2NitCc: '',
+    endoso2Cuenta: '',
+    endoso2Banco: '',
+    endoso2Tipo: '',
+    endoso2Concepto: '',
+    endoso2Valor: '$ 0',
+  };
+};
+
+export interface ActividadInformeFinal {
+  nro: number;
+  actividad: string;
+  periodo: string;
+  lugar: string;
+  poblacion: string;
+  resultados: string;
+  evidencias: string;
+}
+
+export interface AnexoFotograficoFinal {
+  id: string;
+  url: string;
+  descripcion?: string;
+  periodo?: string;
+  fecha?: string;
+}
+
+// Datos contractuales tal como estan en la tabla 'contratos' de la base de datos.
+// Es la fuente de verdad del Informe Final: no se infieren del perfil ni del borrador.
+export interface ContratoContratista {
+  contratoId: string;
+  contratoNro: string;
+  vigencia: string;
+  objeto: string;
+  valorContrato: string;
+  plazoMeses: string;
+  fechaInicio: string;
+  fechaTerminacion: string;
+  supervisorNombre: string;
+  supervisorDocumento: string;
+  supervisorCargo: string;
+  apoyoSupervisionNombre: string;
+  cdpNro: string;
+  crpNro: string;
+  polizaNro: string;
+  dependencia: string;
+  secretariaCodigo: string;
+  secretariaId: string;
+  numeroCuenta: string;
+  banco: string;
+  tipoCuenta: string;
+  ciudad: string;
+}
+
+export interface InformeFinalData {
+  id?: string;
+  userId?: string;
+  contratoNro: string;
+  contratistaNombre: string;
+  contratistaDocumento: string;
+  contratistaLugarDoc?: string;
+  dependencia: string;
+  supervisorNombre: string;
+  supervisorCargo: string;
+  objetoContractual: string;
+  metaPlanDesarrollo: string;
+  indicador: string;
+  fechaPresentacion: string;
+  
+  // Secciones analizadas y redactadas
+  introduccion: string;
+  metodologiaEnfoque: string;
+  metodologiaEstrategias: string;
+  metodologiaZonas: string;
+  metodologiaHerramientas: string;
+  
+  cuadroActividades: ActividadInformeFinal[];
+  
+  productosEntregados: string[];
+  resultadosAlcanzados: string[];
+  cumplimientoMeta: string;
+  analisisTecnico: string;
+  impactoEjecucion: string;
+  conclusiones: string;
+  recomendaciones: string[];
+  
+  anexosFotograficos: AnexoFotograficoFinal[];
+  
+  firmaUrl?: string;
+  firmaContratistaUrl?: string;
+  firmaSupervisorUrl?: string;
+  
+  estado?: 'Borrador' | 'Finalizado';
+  generadoConIA?: boolean;
+  fechaGeneracionIA?: string;
+  updatedAt?: string;
+}
+
+export const createDefaultInformeFinalData = (user?: AuthUser, reports?: ReportData[]): InformeFinalData => {
+  const latestReport = reports && reports.length > 0 ? reports[0] : null;
+  const nombre = (user?.nombreCompleto && user.nombreCompleto !== 'USUARIO REGISTRADO' && user.nombreCompleto !== 'CONTRATISTA')
+    ? user.nombreCompleto
+    : (latestReport?.contratistaNombre || user?.nombreCompleto || '');
+
+  const documento = user?.documentoIdentidad || latestReport?.contratistaDocumento || '';
+
+  const parsedContrato = parseContractNumberAndYear(user?.contratoNro || latestReport?.contratoNro, user, reports);
+  const contrato = parsedContrato.full;
+
+  const dependencia = user?.secretariaNombre || latestReport?.secretariaNombre || '';
+  const supervisor = user?.supervisorNombre || latestReport?.supervisorNombre || '';
+  const supervisorCargo = user?.supervisorCargo || latestReport?.supervisorCargo || '';
+  const objeto = user?.objetoContrato || latestReport?.objeto || '';
+
+  // Extraer anexos fotográficos existentes de los informes mensuales si los hay
+  const anexos: AnexoFotograficoFinal[] = [];
+  if (reports && reports.length > 0) {
+    reports.forEach((rep, rIdx) => {
+      if (rep.anexos && rep.anexos.length > 0) {
+        rep.anexos.forEach((ev, eIdx) => {
+          if (ev.imagenUrl) {
+            anexos.push({
+              id: `anexo-${rIdx}-${eIdx}-${Date.now()}`,
+              url: ev.imagenUrl,
+              descripcion: ev.titulo || `Evidencia fotográfica informe mes ${rep.informeNro || rIdx + 1}`,
+              periodo: rep.periodoDesde ? `${rep.periodoDesde} - ${rep.periodoHasta}` : `Mes ${rep.informeNro || rIdx + 1}`,
+              fecha: rep.fechaPresentacion || rep.periodoHasta
+            });
+          }
+        });
+      }
+    });
+  }
+
+  let lugarDoc = user?.ciudad || (latestReport as any)?.contratistaLugarDoc || '';
+  if (!lugarDoc && typeof localStorage !== 'undefined') {
+    const cleanDoc = documento.replace(/\D/g, '');
+    const decRentaStr = (cleanDoc ? localStorage.getItem(`dec_renta_${cleanDoc}_1`) : null) || 
+                        (documento ? localStorage.getItem(`dec_renta_${documento}_1`) : null);
+    if (decRentaStr) {
+      try {
+        const parsed = JSON.parse(decRentaStr);
+        if (parsed.expedicionCedula) lugarDoc = parsed.expedicionCedula;
+      } catch (e) {}
+    }
+  }
+  if (!lugarDoc) lugarDoc = 'Bogotá D.C';
+
+  return {
+    contratoNro: contrato,
+    contratistaNombre: nombre,
+    contratistaDocumento: documento,
+    contratistaLugarDoc: lugarDoc,
+    dependencia: dependencia,
+    supervisorNombre: supervisor,
+    supervisorCargo: supervisorCargo,
+    objetoContractual: objeto,
+    metaPlanDesarrollo: '',
+    indicador: '',
+    fechaPresentacion: '',
+    
+    introduccion: '',
+    metodologiaEnfoque: '',
+    metodologiaEstrategias: '',
+    metodologiaZonas: '',
+    metodologiaHerramientas: '',
+    
+    cuadroActividades: [],
+    productosEntregados: [],
+    resultadosAlcanzados: [],
+    cumplimientoMeta: '',
+    analisisTecnico: '',
+    impactoEjecucion: '',
+    conclusiones: '',
+    recomendaciones: [],
+    
+    anexosFotograficos: anexos,
+    estado: 'Borrador',
+    generadoConIA: false
+  };
+};
+
