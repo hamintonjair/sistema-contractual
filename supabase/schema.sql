@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- ALCALDÍA MUNICIPAL DE QUIBDÓ - CHOCÓ (NIT: 891680011-0)
--- ESQUEMA Y MIGRACIÓN ROBUSTA POSTGRESQL SUPABASE (7 TABLAS ESTRUCTURALES)
+-- ESQUEMA Y MIGRACIÓN ROBUSTA POSTGRESQL SUPABASE (13 TABLAS ESTRUCTURALES)
 -- ==============================================================================
 
 -- 1. Habilitar extensión para UUIDs
@@ -132,6 +132,8 @@ ALTER TABLE contratos ADD COLUMN IF NOT EXISTS banco TEXT;
 ALTER TABLE contratos ADD COLUMN IF NOT EXISTS tipo_cuenta TEXT;
 ALTER TABLE contratos ADD COLUMN IF NOT EXISTS ciudad TEXT;
 ALTER TABLE contratos ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE;
+ALTER TABLE contratos ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE contratos ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 -- ==============================================================================
 -- TABLA 4: informes_mensuales (Cabecera de Informes Contractuales Radicados)
@@ -151,6 +153,7 @@ CREATE TABLE IF NOT EXISTS informes_mensuales (
   estado TEXT DEFAULT 'Enviado',
   motivo_rechazo TEXT,
   fecha_aprobacion TIMESTAMPTZ,
+  comentarios_campos JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -169,6 +172,9 @@ ALTER TABLE informes_mensuales ADD COLUMN IF NOT EXISTS valor_pagar_certificado 
 ALTER TABLE informes_mensuales ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'Enviado';
 ALTER TABLE informes_mensuales ADD COLUMN IF NOT EXISTS motivo_rechazo TEXT;
 ALTER TABLE informes_mensuales ADD COLUMN IF NOT EXISTS fecha_aprobacion TIMESTAMPTZ;
+ALTER TABLE informes_mensuales ADD COLUMN IF NOT EXISTS comentarios_campos JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE informes_mensuales ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE informes_mensuales ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 -- ==============================================================================
 -- TABLA 5: informe_obligaciones (Obligaciones Contractuales Específicas 1:N)
@@ -188,6 +194,7 @@ ALTER TABLE informe_obligaciones ADD COLUMN IF NOT EXISTS obligacion_descripcion
 ALTER TABLE informe_obligaciones ADD COLUMN IF NOT EXISTS actividades_realizadas TEXT;
 ALTER TABLE informe_obligaciones ADD COLUMN IF NOT EXISTS soportes_texto TEXT DEFAULT 'Anexo fotográfico';
 ALTER TABLE informe_obligaciones ADD COLUMN IF NOT EXISTS orden INTEGER DEFAULT 1;
+ALTER TABLE informe_obligaciones ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 
 -- ==============================================================================
 -- TABLA 6: informe_anexos (Evidencias y Soportes Fotográficos en Cuadrícula 2 por Hoja)
@@ -205,6 +212,7 @@ ALTER TABLE informe_anexos ADD COLUMN IF NOT EXISTS informe_id UUID REFERENCES i
 ALTER TABLE informe_anexos ADD COLUMN IF NOT EXISTS titulo TEXT;
 ALTER TABLE informe_anexos ADD COLUMN IF NOT EXISTS imagen_url TEXT;
 ALTER TABLE informe_anexos ADD COLUMN IF NOT EXISTS orden INTEGER DEFAULT 1;
+ALTER TABLE informe_anexos ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 
 -- ==============================================================================
 -- TABLA 7: certificaciones_supervision (Certificados de Cumplimiento y Trámite de Pago)
@@ -253,6 +261,7 @@ ALTER TABLE certificaciones_supervision ADD COLUMN IF NOT EXISTS expedicion_ano 
 ALTER TABLE certificaciones_supervision ADD COLUMN IF NOT EXISTS datos_formulario JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE certificaciones_supervision ADD COLUMN IF NOT EXISTS certifica_cumplimiento BOOLEAN DEFAULT TRUE;
 ALTER TABLE certificaciones_supervision ADD COLUMN IF NOT EXISTS fecha_certificacion TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE certificaciones_supervision ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE certificaciones_supervision ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS idx_certificaciones_informe ON certificaciones_supervision(informe_id);
@@ -356,6 +365,21 @@ CREATE POLICY "anexos_delete" ON storage.objects FOR DELETE TO public USING (buc
 
 -- Para quitar el warning de "list all files", hacemos que el SELECT sea específico
 CREATE POLICY "anexos_select" ON storage.objects FOR SELECT TO public USING (bucket_id = 'anexos');
+
+-- Políticas de acceso para el bucket 'firma'
+DROP POLICY IF EXISTS "Lectura publica bucket firma" ON storage.objects;
+DROP POLICY IF EXISTS "Subida bucket firma" ON storage.objects;
+DROP POLICY IF EXISTS "Actualizacion bucket firma" ON storage.objects;
+DROP POLICY IF EXISTS "Eliminacion bucket firma" ON storage.objects;
+
+CREATE POLICY "Lectura publica bucket firma" ON storage.objects FOR SELECT TO public USING (bucket_id = 'firma');
+CREATE POLICY "Subida bucket firma" ON storage.objects FOR INSERT TO public WITH CHECK (bucket_id = 'firma');
+CREATE POLICY "Actualizacion bucket firma" ON storage.objects FOR UPDATE TO public USING (bucket_id = 'firma');
+CREATE POLICY "Eliminacion bucket firma" ON storage.objects FOR DELETE TO public USING (bucket_id = 'firma');
+
+-- ==============================================================================
+-- TABLA 8: soportes_fiduciaria
+-- ==============================================================================
 CREATE TABLE IF NOT EXISTS soportes_fiduciaria (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   informe_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE,
@@ -366,15 +390,28 @@ CREATE TABLE IF NOT EXISTS soportes_fiduciaria (
   fecha_creacion TIMESTAMPTZ DEFAULT NOW(),
   fecha_actualizacion TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE soportes_fiduciaria ADD COLUMN IF NOT EXISTS informe_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE;
+ALTER TABLE soportes_fiduciaria ADD COLUMN IF NOT EXISTS contrato_id UUID REFERENCES contratos(id) ON DELETE CASCADE;
+ALTER TABLE soportes_fiduciaria ADD COLUMN IF NOT EXISTS contratista_documento TEXT;
+ALTER TABLE soportes_fiduciaria ADD COLUMN IF NOT EXISTS pago_nro TEXT DEFAULT '1';
+ALTER TABLE soportes_fiduciaria ADD COLUMN IF NOT EXISTS datos_formulario JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE soportes_fiduciaria ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE soportes_fiduciaria ADD COLUMN IF NOT EXISTS fecha_actualizacion TIMESTAMPTZ DEFAULT NOW();
+
 ALTER TABLE soportes_fiduciaria ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Lectura y escritura soportes fiduciaria" ON soportes_fiduciaria;
 CREATE POLICY "Lectura y escritura soportes fiduciaria" ON soportes_fiduciaria FOR ALL USING (true);
 CREATE INDEX IF NOT EXISTS idx_soportes_fiduciaria_informe ON soportes_fiduciaria(informe_id);
 CREATE INDEX IF NOT EXISTS idx_soportes_fiduciaria_doc ON soportes_fiduciaria(contratista_documento);
 
+-- ==============================================================================
+-- TABLA 9: declaraciones_renta
+-- ==============================================================================
 CREATE TABLE IF NOT EXISTS declaraciones_renta (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   informe_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE,
+  contrato_id UUID REFERENCES contratos(id) ON DELETE CASCADE,
   contratista_documento TEXT,
   pago_nro TEXT DEFAULT '1',
   datos_formulario JSONB DEFAULT '{}'::jsonb,
@@ -382,12 +419,23 @@ CREATE TABLE IF NOT EXISTS declaraciones_renta (
   fecha_actualizacion TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE declaraciones_renta ADD COLUMN IF NOT EXISTS informe_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE;
+ALTER TABLE declaraciones_renta ADD COLUMN IF NOT EXISTS contrato_id UUID REFERENCES contratos(id) ON DELETE CASCADE;
+ALTER TABLE declaraciones_renta ADD COLUMN IF NOT EXISTS contratista_documento TEXT;
+ALTER TABLE declaraciones_renta ADD COLUMN IF NOT EXISTS pago_nro TEXT DEFAULT '1';
+ALTER TABLE declaraciones_renta ADD COLUMN IF NOT EXISTS datos_formulario JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE declaraciones_renta ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE declaraciones_renta ADD COLUMN IF NOT EXISTS fecha_actualizacion TIMESTAMPTZ DEFAULT NOW();
+
 ALTER TABLE declaraciones_renta ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Lectura y escritura declaraciones renta" ON declaraciones_renta;
 CREATE POLICY "Lectura y escritura declaraciones renta" ON declaraciones_renta FOR ALL USING (true);
 CREATE INDEX IF NOT EXISTS idx_declaraciones_renta_informe ON declaraciones_renta(informe_id);
 CREATE INDEX IF NOT EXISTS idx_declaraciones_renta_doc ON declaraciones_renta(contratista_documento);
 
+-- ==============================================================================
+-- TABLA 10: autorizaciones_desembolso
+-- ==============================================================================
 CREATE TABLE IF NOT EXISTS autorizaciones_desembolso (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   informe_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE,
@@ -398,12 +446,22 @@ CREATE TABLE IF NOT EXISTS autorizaciones_desembolso (
   fecha_actualizacion TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE autorizaciones_desembolso ADD COLUMN IF NOT EXISTS informe_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE;
+ALTER TABLE autorizaciones_desembolso ADD COLUMN IF NOT EXISTS contratista_documento TEXT;
+ALTER TABLE autorizaciones_desembolso ADD COLUMN IF NOT EXISTS pago_nro TEXT DEFAULT '1';
+ALTER TABLE autorizaciones_desembolso ADD COLUMN IF NOT EXISTS datos_formulario JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE autorizaciones_desembolso ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE autorizaciones_desembolso ADD COLUMN IF NOT EXISTS fecha_actualizacion TIMESTAMPTZ DEFAULT NOW();
+
 ALTER TABLE autorizaciones_desembolso ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Lectura y escritura autorizaciones desembolso" ON autorizaciones_desembolso;
 CREATE POLICY "Lectura y escritura autorizaciones desembolso" ON autorizaciones_desembolso FOR ALL USING (true);
 CREATE INDEX IF NOT EXISTS idx_autorizaciones_desembolso_informe ON autorizaciones_desembolso(informe_id);
 CREATE INDEX IF NOT EXISTS idx_autorizaciones_desembolso_doc ON autorizaciones_desembolso(contratista_documento);
 
+-- ==============================================================================
+-- TABLA 11: notificaciones
+-- ==============================================================================
 CREATE TABLE IF NOT EXISTS notificaciones (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id TEXT NOT NULL,
@@ -415,22 +473,42 @@ CREATE TABLE IF NOT EXISTS notificaciones (
   report_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE
 );
 
+ALTER TABLE notificaciones ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE notificaciones ADD COLUMN IF NOT EXISTS mensaje TEXT;
+ALTER TABLE notificaciones ADD COLUMN IF NOT EXISTS tipo TEXT DEFAULT 'info';
+ALTER TABLE notificaciones ADD COLUMN IF NOT EXISTS leida BOOLEAN DEFAULT false;
+ALTER TABLE notificaciones ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE notificaciones ADD COLUMN IF NOT EXISTS informe_nro TEXT;
+ALTER TABLE notificaciones ADD COLUMN IF NOT EXISTS report_id UUID REFERENCES informes_mensuales(id) ON DELETE CASCADE;
+
 ALTER TABLE notificaciones ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Permitir todo notificaciones" ON notificaciones;
 CREATE POLICY "Permitir todo notificaciones" ON notificaciones FOR ALL USING (true);
 CREATE INDEX IF NOT EXISTS idx_notificaciones_user_id ON notificaciones(user_id);
 CREATE INDEX IF NOT EXISTS idx_notificaciones_leida ON notificaciones(leida);
+CREATE INDEX IF NOT EXISTS idx_notificaciones_created_at ON notificaciones(created_at DESC);
 
 -- ==============================================================================
--- TABLAS PARA INTELIGENCIA ARTIFICIAL E INFORME FINAL
+-- TABLA 12: configuracion_ia
 -- ==============================================================================
 CREATE TABLE IF NOT EXISTS configuracion_ia (
   id TEXT PRIMARY KEY DEFAULT 'global_config',
-  api_key TEXT NOT NULL,
+  api_key TEXT DEFAULT '',
   modelo TEXT NOT NULL DEFAULT 'gemini-3.8-flash',
+  logo_url TEXT,
+  membrete_url TEXT,
   updated_at TIMESTAMPTZ DEFAULT now(),
   updated_by TEXT
 );
+
+ALTER TABLE configuracion_ia ADD COLUMN IF NOT EXISTS api_key TEXT DEFAULT '';
+ALTER TABLE configuracion_ia ADD COLUMN IF NOT EXISTS modelo TEXT DEFAULT 'gemini-3.8-flash';
+ALTER TABLE configuracion_ia ADD COLUMN IF NOT EXISTS logo_url TEXT;
+ALTER TABLE configuracion_ia ADD COLUMN IF NOT EXISTS membrete_url TEXT;
+ALTER TABLE configuracion_ia ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE configuracion_ia ADD COLUMN IF NOT EXISTS updated_by TEXT;
+ALTER TABLE configuracion_ia ALTER COLUMN api_key SET DEFAULT '';
+ALTER TABLE configuracion_ia ALTER COLUMN api_key DROP NOT NULL;
 
 ALTER TABLE configuracion_ia ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Lectura publica configuracion_ia" ON configuracion_ia;
@@ -438,6 +516,9 @@ CREATE POLICY "Lectura publica configuracion_ia" ON configuracion_ia FOR SELECT 
 DROP POLICY IF EXISTS "Actualizacion configuracion_ia" ON configuracion_ia;
 CREATE POLICY "Actualizacion configuracion_ia" ON configuracion_ia FOR ALL USING (true) WITH CHECK (true);
 
+-- ==============================================================================
+-- TABLA 13: informes_finales
+-- ==============================================================================
 CREATE TABLE IF NOT EXISTS informes_finales (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id TEXT,
@@ -473,6 +554,55 @@ CREATE TABLE IF NOT EXISTS informes_finales (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+-- Asegurar columnas si la tabla ya existía sin ellas
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS contratista_nombre TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS contratista_lugar_doc TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS dependencia TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS supervisor_nombre TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS supervisor_cargo TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS objeto_contractual TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS periodo_ejecucion TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS fecha_presentacion TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS meta_plan_desarrollo TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS indicador TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS introduccion TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS metodologia_enfoque TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS metodologia_estrategias TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS metodologia_zonas TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS metodologia_herramientas TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS cuadro_actividades JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS productos_entregados JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS resultados_alcanzados JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS cumplimiento_meta TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS analisis_tecnico TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS impacto_ejecucion TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS conclusiones TEXT;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS recomendaciones JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS anexos_fotograficos JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS generado_con_ia BOOLEAN DEFAULT false;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS fecha_generacion_ia TIMESTAMPTZ;
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE informes_finales ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+
+-- Eliminar restricción compuesta obsoleta y asegurar unicidad por contratista (documento_identidad)
+ALTER TABLE informes_finales DROP CONSTRAINT IF EXISTS uq_informe_final_contrato;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_index i
+    JOIN pg_class t ON i.indrelid = t.oid
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+    WHERE t.relname = 'informes_finales'
+      AND i.indisunique = true
+      AND i.indnatts = 1
+      AND a.attname = 'documento_identidad'
+  ) THEN
+    ALTER TABLE informes_finales ADD CONSTRAINT uq_informe_final_documento UNIQUE (documento_identidad);
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_informes_finales_doc ON informes_finales(documento_identidad);
 CREATE INDEX IF NOT EXISTS idx_informes_finales_contrato ON informes_finales(contrato_nro);
 
@@ -481,25 +611,6 @@ DROP POLICY IF EXISTS "Lectura informes_finales" ON informes_finales;
 CREATE POLICY "Lectura informes_finales" ON informes_finales FOR SELECT USING (true);
 DROP POLICY IF EXISTS "Modificacion informes_finales" ON informes_finales;
 CREATE POLICY "Modificacion informes_finales" ON informes_finales FOR ALL USING (true) WITH CHECK (true);
-
--- ==============================================================================
--- BUCKET DE ALMACENAMIENTO PARA LOGOS Y ANEXOS (storage.buckets y carpetas logo/)
--- ==============================================================================
-INSERT INTO storage.buckets (id, name, public)
-VALUES ('anexos', 'anexos', true)
-ON CONFLICT (id) DO UPDATE SET public = true;
-
-DROP POLICY IF EXISTS "Lectura publica bucket anexos" ON storage.objects;
-CREATE POLICY "Lectura publica bucket anexos" ON storage.objects
-  FOR SELECT USING (bucket_id = 'anexos');
-
-DROP POLICY IF EXISTS "Permitir subida en bucket anexos" ON storage.objects;
-CREATE POLICY "Permitir subida en bucket anexos" ON storage.objects
-  FOR INSERT WITH CHECK (bucket_id = 'anexos');
-
-DROP POLICY IF EXISTS "Permitir actualizacion en bucket anexos" ON storage.objects;
-CREATE POLICY "Permitir actualizacion en bucket anexos" ON storage.objects
-  FOR UPDATE USING (bucket_id = 'anexos');
 
 
 
