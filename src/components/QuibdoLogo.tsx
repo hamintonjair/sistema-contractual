@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { SUPABASE_CONFIG } from '../config/supabaseConfig';
+import { SUPABASE_CONFIG } from '../lib/supabase';
 
 const BASE_STORAGE_URL = `${SUPABASE_CONFIG.url.replace(/\/$/, '')}/storage/v1/object/public/anexos`;
 

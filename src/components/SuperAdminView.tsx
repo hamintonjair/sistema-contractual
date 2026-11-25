@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Secretaria, AuthUser, InformeSummary } from '../types';
 import { supabaseService } from '../services/supabaseService';
-import { SUPABASE_CONFIG } from '../config/supabaseConfig';
+import { SUPABASE_CONFIG } from '../lib/supabase';
 import Footer from './Footer';
 import QuibdoLogo from './QuibdoLogo';
 import { 

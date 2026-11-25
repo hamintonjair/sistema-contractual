@@ -439,5 +439,103 @@ export const formatFechaDeclaracionRenta = (raw?: string, ciudadDefault: string 
   return str.startsWith(ciudad) ? str : `${ciudad}, ${str}`;
 };
 
+/**
+ * Extrae el índice de mes (0-11) y el año (ej. 2026) desde cualquier cadena de fecha
+ * ("Quibdó, 31 de octubre de 2026", "2026-11-30", "30/11/2026", "NOVIEMBRE DE 2026").
+ */
+export const extractMonthAndYearFromFecha = (str?: string): { monthIdx: number; year: number } | null => {
+  if (!str || !String(str).trim()) return null;
+  const meses = [
+    'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+  ];
+  const s = String(str).trim().toLowerCase();
 
+  // 1. Formato textual "DD de mes de YYYY"
+  const textMatch = s.match(/(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+de\s+(20\d{2})/i);
+  if (textMatch) {
+    const mIdx = meses.indexOf(textMatch[2].toLowerCase());
+    const yr = parseInt(textMatch[3], 10);
+    if (mIdx !== -1 && !isNaN(yr)) return { monthIdx: mIdx, year: yr };
+  }
 
+  // 2. Formato YYYY-MM-DD
+  const ymdMatch = s.match(/^(?:[^,]+,\s*)?(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (ymdMatch) {
+    const yr = parseInt(ymdMatch[1], 10);
+    const mIdx = parseInt(ymdMatch[2], 10) - 1;
+    if (mIdx >= 0 && mIdx < 12) return { monthIdx: mIdx, year: yr };
+  }
+
+  // 3. Formato DD/MM/YYYY o DD-MM-YYYY
+  const dmyMatch = s.match(/^(?:[^,]+,\s*)?(\d{1,2})[-\/](\d{1,2})[-\/](20\d{2})/);
+  if (dmyMatch) {
+    const mIdx = parseInt(dmyMatch[2], 10) - 1;
+    const yr = parseInt(dmyMatch[3], 10);
+    if (mIdx >= 0 && mIdx < 12) return { monthIdx: mIdx, year: yr };
+  }
+
+  // 4. Formato de aplicación "NOVIEMBRE DE 2026"
+  for (let i = 0; i < meses.length; i++) {
+    if (s.includes(meses[i])) {
+      const yrMatch = s.match(/\b(20\d{2})\b/);
+      const yr = yrMatch ? parseInt(yrMatch[1], 10) : 2026;
+      return { monthIdx: i, year: yr };
+    }
+  }
+
+  return null;
+};
+
+/**
+ * Resuelve la fecha de la Declaración Bajo Juramento garantizando que siempre corresponda
+ * al mes y año del informe activo (periodoHasta / fechaPresentacion / periodoDesde).
+ */
+export const resolveFechaDeclaracionRenta = (
+  savedFecha?: string,
+  reportData?: {
+    id?: string;
+    periodoHasta?: string;
+    fechaPresentacion?: string;
+    periodoDesde?: string;
+    fechaAplicacion?: string;
+  },
+  savedReportId?: string,
+  ciudadDefault: string = 'Quibdó'
+): string => {
+  let ciudad = ciudadDefault;
+  if (savedFecha && savedFecha.includes(',')) {
+    const candidateCity = savedFecha.split(',')[0].trim();
+    if (candidateCity && candidateCity.length < 35 && !/\d/.test(candidateCity)) {
+      ciudad = candidateCity;
+    }
+  }
+
+  const rawReportDate = reportData?.periodoHasta || reportData?.fechaPresentacion || reportData?.periodoDesde;
+  if (!rawReportDate && !reportData?.fechaAplicacion) {
+    return formatFechaDeclaracionRenta(savedFecha || '14 de julio de 2026', ciudad);
+  }
+
+  const expectedReportFecha = rawReportDate
+    ? formatFechaDeclaracionRenta(rawReportDate, ciudad)
+    : formatFechaDeclaracionRenta(savedFecha || '14 de julio de 2026', ciudad);
+
+  if (!savedFecha || !String(savedFecha).trim()) {
+    return expectedReportFecha;
+  }
+
+  // Si la declaración guardada provenía de otro informe distinto, usar la fecha del informe actual
+  if (savedReportId && reportData?.id && savedReportId !== reportData.id) {
+    return expectedReportFecha;
+  }
+
+  const reportMY = extractMonthAndYearFromFecha(rawReportDate || reportData?.fechaAplicacion);
+  const savedMY = extractMonthAndYearFromFecha(savedFecha);
+
+  // Si el mes o año guardado no coincide con el mes o año del informe, forzar la fecha del informe
+  if (reportMY && (!savedMY || savedMY.monthIdx !== reportMY.monthIdx || savedMY.year !== reportMY.year)) {
+    return expectedReportFecha;
+  }
+
+  return formatFechaDeclaracionRenta(savedFecha, ciudad);
+};

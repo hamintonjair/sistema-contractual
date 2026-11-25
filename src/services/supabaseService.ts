@@ -4411,7 +4411,7 @@ export const supabaseService = {
 
         if (!error && data?.datos_formulario) return sanitizeDeclaracionForm(data.datos_formulario, data.id);
 
-        // Fallback: Buscar la última declaración de este contratista independientemente del pago
+        // Fallback: Buscar la última declaración de este contratista independientemente del pago (solo para heredar datos fijos como lugar de expedición y retención, sin copiar la fecha del mes anterior)
         const { data: latestData } = await supabase
           .from('declaraciones_renta')
           .select('*')
@@ -4420,7 +4420,15 @@ export const supabaseService = {
           .limit(1)
           .maybeSingle();
 
-        if (latestData?.datos_formulario) return sanitizeDeclaracionForm(latestData.datos_formulario, latestData.id);
+        if (latestData?.datos_formulario) {
+          const sanitizedTemplate = sanitizeDeclaracionForm(latestData.datos_formulario, latestData.id);
+          return {
+            ...sanitizedTemplate,
+            id: undefined,
+            reportId: informeId || undefined,
+            fecha: '',
+          };
+        }
       }
     } catch (e) {
       console.warn('Error fetching declaracion renta:', e);

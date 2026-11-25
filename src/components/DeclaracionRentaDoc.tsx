@@ -4,7 +4,7 @@ import { supabaseService } from '../services/supabaseService';
 import FieldCommentModal from './FieldCommentModal';
 import { Save, Check, Edit3, Sparkles, MessageSquare, AlertTriangle, CheckCircle2, FileText, Upload, Trash2 } from 'lucide-react';
 import { exportDeclaracionRentaToWord } from '../export/declaracionRentaWord';
-import { formatFechaDeclaracionRenta } from '../utils/formatters';
+import { formatFechaDeclaracionRenta, resolveFechaDeclaracionRenta } from '../utils/formatters';
 
 interface DeclaracionRentaDocProps {
   key?: React.Key;
@@ -68,7 +68,7 @@ export default function DeclaracionRentaDoc({
 
   const getIdentityKey = () => {
     if (data?.id) return `data_${data.id}`;
-    if (reportData) return `rep_${reportData.id || ''}_${reportData.informeNro || ''}_${storageKey || ''}`;
+    if (reportData) return `rep_${reportData.id || ''}_${reportData.informeNro || ''}_${reportData.periodoDesde || ''}_${reportData.periodoHasta || ''}_${reportData.fechaPresentacion || ''}_${storageKey || ''}`;
     return 'default';
   };
 
@@ -81,7 +81,10 @@ export default function DeclaracionRentaDoc({
     else initial = createDefaultDeclaracionRentaData();
     return {
       ...initial,
-      senores: normalizeSenores(initial.senores)
+      senores: normalizeSenores(initial.senores),
+      fecha: reportData
+        ? resolveFechaDeclaracionRenta(initial.fecha, reportData, initial.reportId)
+        : formatFechaDeclaracionRenta(initial.fecha)
     };
   });
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
@@ -115,7 +118,13 @@ export default function DeclaracionRentaDoc({
   const handleExportWord = async () => {
     setIsExportingWord(true);
     try {
-      const blob = await exportDeclaracionRentaToWord({ ...formData, firmaUrl: activeFirma || formData.firmaUrl }, reportData);
+      const resolvedFecha = reportData
+        ? resolveFechaDeclaracionRenta(formData.fecha, reportData, formData.reportId)
+        : formatFechaDeclaracionRenta(formData.fecha);
+      const blob = await exportDeclaracionRentaToWord(
+        { ...formData, fecha: resolvedFecha, firmaUrl: activeFirma || formData.firmaUrl },
+        reportData
+      );
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
       const nombreClean = (formData.nombresApellidos || 'Contratista').replace(/\s+/g, '_');
@@ -165,18 +174,39 @@ export default function DeclaracionRentaDoc({
 
       if (loadedKeyRef.current === currentKey) {
         const expLugar = baseData.expedicionCedula || reportData?.contratistaLugarDoc || 'Bogotá D.C';
-        setFormData({
+        const resolvedFecha = reportData
+          ? resolveFechaDeclaracionRenta(baseData.fecha, reportData, baseData.reportId)
+          : formatFechaDeclaracionRenta(baseData.fecha || '14 de julio de 2026');
+        const normalizedForm: DeclaracionRentaData = {
           ...baseData,
           expedicionCedula: expLugar,
           firmaExpedicion: expLugar,
           senores: normalizeSenores(baseData.senores),
           reportId: reportData?.id || baseData.reportId,
-          fecha: formatFechaDeclaracionRenta(baseData.fecha || (reportData ? createDefaultDeclaracionRentaData(reportData).fecha : '14 de julio de 2026')),
-        });
+          fecha: resolvedFecha,
+        };
+        setFormData(normalizedForm);
+
+        // Si la fecha tenía un mes distinto al del informe (por ej. heredado de un pago anterior), sincronizar en segundo plano
+        if (reportData && baseData.fecha && baseData.fecha !== resolvedFecha) {
+          const key = storageKey || `dec_renta_${reportData.contratistaDocumento || ''}_${reportData.informeNro || '1'}`;
+          try {
+            localStorage.setItem(key, JSON.stringify(normalizedForm));
+          } catch (e) {}
+          if (reportData.id && !reportData.id.startsWith('inf-')) {
+            supabaseService.saveDeclaracionRenta(
+              reportData.id,
+              normalizedForm,
+              normalizedForm.cedula || reportData.contratistaDocumento || '',
+              reportData.informeNro?.toString() || '1',
+              reportData.contratoId
+            ).catch(() => {});
+          }
+        }
       }
     };
     loadData();
-  }, [data, reportData?.id, reportData?.informeNro, reportData?.periodoHasta, reportData?.fechaPresentacion, storageKey]);
+  }, [data, reportData?.id, reportData?.informeNro, reportData?.periodoDesde, reportData?.periodoHasta, reportData?.fechaPresentacion, storageKey]);
 
   const handleFieldChange = (field: keyof DeclaracionRentaData, value: string | boolean) => {
     let updated = { ...formData, [field]: value };

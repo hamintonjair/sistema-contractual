@@ -1,6 +1,6 @@
 import PizZip from 'pizzip';
 import { DeclaracionRentaData, ReportData } from '../types';
-import { formatFechaDeclaracionRenta } from '../utils/formatters';
+import { formatFechaDeclaracionRenta, resolveFechaDeclaracionRenta } from '../utils/formatters';
 import { supabaseService } from '../services/supabaseService';
 
 /**
@@ -77,9 +77,10 @@ export async function exportDeclaracionRentaToWord(
     throw new Error('El archivo de plantilla no contiene word/document.xml');
   }
 
-  // 3. Prepare replacement values
-  const rawDate = data.fecha || reportData?.periodoHasta || reportData?.fechaPresentacion || '14 de julio de 2026';
-  const fechaStr = formatFechaDeclaracionRenta(rawDate);
+  // 3. Prepare replacement values ensuring the date matches the active report's month
+  const fechaStr = reportData
+    ? resolveFechaDeclaracionRenta(data.fecha, reportData, data.reportId)
+    : formatFechaDeclaracionRenta(data.fecha || '14 de julio de 2026');
   const nombreContratista = (data.nombresApellidos || reportData?.contratistaNombre || 'HAMINTON MENA MENA').trim().toUpperCase();
   const cedulaContratista = (data.cedula || reportData?.contratistaDocumento || '80.772.379').trim();
   const expedicionCedula = (data.expedicionCedula || reportData?.contratistaLugarDoc || 'Bogotá D.C').trim();
@@ -99,11 +100,11 @@ export async function exportDeclaracionRentaToWord(
   const line2 = senoresLines[2] || 'Ciudad.';
 
   // Build Date XML paragraph with clean separation before Señores (font size 11pt / sz 22)
-  const fechaXml = `<w:p w14:paraId="347D8A10" w14:textId="77777777" w:rsidR="00A856BF" w:rsidRDefault="00A856BF" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="240" w:line="240" w:lineRule="auto"/><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(fechaStr)}</w:t></w:r></w:p><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr></w:p>`;
+  const fechaXml = `<w:p w14:paraId="10AC529B" w14:textId="3A422153" w:rsidR="00A856BF" w:rsidRDefault="00A856BF" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(fechaStr)}</w:t></w:r></w:p>`;
 
   // Build Senores XML paragraphs (font size 11pt)
-  const senores0Xml = `<w:p w14:paraId="3B8F89A5" w14:textId="77777777" w:rsidR="00A856BF" w:rsidRDefault="00A856BF" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(line0)}</w:t></w:r></w:p>`;
-  const senores1Xml = `<w:p w14:paraId="2E7E2C95" w14:textId="77777777" w:rsidR="00A856BF" w:rsidRDefault="00E37F39" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:rPr><w:b/><w:bCs/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:b/><w:bCs/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(line1)}</w:t></w:r></w:p>`;
+  const senores0Xml = `<w:p w14:paraId="4C1F55F7" w14:textId="77777777" w:rsidR="00A856BF" w:rsidRDefault="00A856BF" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(line0)}</w:t></w:r></w:p>`;
+  const senores1Xml = `<w:p w14:paraId="6931BC52" w14:textId="3A3B75FB" w:rsidR="00A856BF" w:rsidRDefault="00E37F39" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:rPr><w:b/><w:bCs/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:b/><w:bCs/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(line1)}</w:t></w:r></w:p>`;
   const senores2Xml = `<w:p w14:paraId="34127C97" w14:textId="77777777" w:rsidR="00A856BF" w:rsidRDefault="00A856BF" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(line2)}</w:t></w:r></w:p>`;
 
   // Build REF and Title XML (font size 11pt, preserving original layout)
@@ -136,13 +137,19 @@ export async function exportDeclaracionRentaToWord(
   const firmaCedulaXml = `<w:p w14:paraId="2C48F7A4" w14:textId="38397B80" w:rsidR="00A856BF" w:rsidRDefault="00A856BF" w:rsidP="00A856BF"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:pPr><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t xml:space="preserve">C.C. </w:t></w:r><w:r w:rsidR="00AC639B"><w:rPr><w:b/><w:bCs/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t>${escapeXml(firmaCedula)}</w:t></w:r><w:r><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr><w:t xml:space="preserve"> de ${escapeXml(firmaExpedicion)}</w:t></w:r></w:p>`;
 
   // Precise replacement by paragraph ID and fallback patterns
-  if (documentXml.includes('347D8A10')) {
+  if (documentXml.includes('10AC529B')) {
+    documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="10AC529B"[\s\S]*?<\/w:p>/, fechaXml);
+  } else if (documentXml.includes('347D8A10')) {
     documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="347D8A10"[\s\S]*?<\/w:p>/, fechaXml);
   } else {
     documentXml = documentXml.replace(/<w:p\b[^>]*>(?:(?!<\/w:p>)[\s\S])*?Quibdó[\s\S]*?<\/w:p>/, fechaXml);
   }
 
-  if (documentXml.includes('3B8F89A5')) {
+  if (documentXml.includes('4C1F55F7')) {
+    documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="4C1F55F7"[\s\S]*?<\/w:p>/, senores0Xml);
+    documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="6931BC52"[\s\S]*?<\/w:p>/, senores1Xml);
+    documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="34127C97"[\s\S]*?<\/w:p>/, senores2Xml);
+  } else if (documentXml.includes('3B8F89A5')) {
     documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="3B8F89A5"[\s\S]*?<\/w:p>/, senores0Xml);
     documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="2E7E2C95"[\s\S]*?<\/w:p>/, senores1Xml);
     documentXml = documentXml.replace(/<w:p\b[^>]*w14:paraId="34127C97"[\s\S]*?<\/w:p>/, senores2Xml);
