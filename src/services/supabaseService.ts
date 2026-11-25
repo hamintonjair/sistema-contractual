@@ -3339,7 +3339,7 @@ export const supabaseService = {
         }
 
         // Limpiar registros sueltos o vinculados por documento y número de pago/informe
-        await supabase.from('certificaciones_supervision').delete().eq('contratista_documento', contractorDoc).eq('informe_nro', informeNro);
+        await supabase.from('certificaciones_supervision').delete().eq('contratista_documento', contractorDoc).eq('pago_nro', informeNro);
         await supabase.from('soportes_fiduciaria').delete().eq('contratista_documento', contractorDoc).eq('pago_nro', informeNro);
         await supabase.from('declaraciones_renta').delete().eq('contratista_documento', contractorDoc).eq('pago_nro', informeNro);
         await supabase.from('autorizaciones_desembolso').delete().eq('contratista_documento', contractorDoc).eq('pago_nro', informeNro);

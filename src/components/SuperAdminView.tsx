@@ -1619,7 +1619,7 @@ export default function SuperAdminView({ user }: Props) {
                           <p className="text-[11px]">
                             Acceder en el Panel de Supabase Storage: {' '}
                             <a 
-                              href={`https://supabase.com/dashboard/project/${SUPABASE_CONFIG.url.match(/https?:\/\/([^.]+)\.supabase\.co/)?.[1] || 'usdsynzkedjydlynkala'}/storage/files/buckets/anexos?path=logo`}
+                              href={`https://supabase.com/dashboard/project/${SUPABASE_CONFIG.url.match(/https?:\/\/([^.]+)\.supabase\.co/)?.[1] || 'rnkisljndrunbbuavwgl'}/storage/files/buckets/anexos?path=logo`}
                               target="_blank"
                               rel="noreferrer"
                               className="text-emerald-700 underline font-semibold hover:text-emerald-900"
@@ -1753,7 +1753,7 @@ export default function SuperAdminView({ user }: Props) {
                           <p className="text-[11px]">
                             Acceder en el Panel de Supabase Storage: {' '}
                             <a 
-                              href={`https://supabase.com/dashboard/project/${SUPABASE_CONFIG.url.match(/https?:\/\/([^.]+)\.supabase\.co/)?.[1] || 'usdsynzkedjydlynkala'}/storage/files/buckets/anexos?path=membretes`}
+                              href={`https://supabase.com/dashboard/project/${SUPABASE_CONFIG.url.match(/https?:\/\/([^.]+)\.supabase\.co/)?.[1] || 'rnkisljndrunbbuavwgl'}/storage/files/buckets/anexos?path=membretes`}
                               target="_blank"
                               rel="noreferrer"
                               className="text-emerald-700 underline font-semibold hover:text-emerald-900"
