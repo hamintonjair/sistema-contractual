@@ -21,7 +21,16 @@ export default function App() {
     const savedUser = localStorage.getItem('alcaldia_quibdo_user');
     if (savedUser) {
       try {
-        return JSON.parse(savedUser);
+        const parsed = JSON.parse(savedUser);
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.supervisorNombre && String(parsed.supervisorNombre).toUpperCase().includes('DIANA ANDREA')) {
+            parsed.supervisorNombre = 'JUAN JOSÉ PINO MOSQUERA';
+          }
+          if (parsed.supervisorDocumento && String(parsed.supervisorDocumento).replace(/\D/g, '') === '35602521') {
+            parsed.supervisorDocumento = '11.809.440';
+          }
+        }
+        return parsed;
       } catch (e) {
         return null;
       }
@@ -145,6 +154,12 @@ export default function App() {
 
   const handleOpenReportEditor = (report: ReportData) => {
     let reportToLoad: ReportData = { ...report };
+    if (!reportToLoad.supervisorNombre || reportToLoad.supervisorNombre.toUpperCase().includes('DIANA ANDREA')) {
+      reportToLoad.supervisorNombre = 'JUAN JOSÉ PINO MOSQUERA';
+    }
+    if (!reportToLoad.supervisorDocumento || String(reportToLoad.supervisorDocumento).replace(/\D/g, '') === '35602521') {
+      reportToLoad.supervisorDocumento = '11.809.440';
+    }
 
     if (reportToLoad.estado === 'Borrador') {
       reportToLoad.comentariosCampos = {};

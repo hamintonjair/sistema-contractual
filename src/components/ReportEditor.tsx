@@ -1249,7 +1249,7 @@ export default function ReportEditor({
                     type="text"
                     value={data.supervisorDocumento}
                     onChange={(e) => handleChange('supervisorDocumento', e.target.value)}
-                    placeholder="Ej. 35.602.521"
+                    placeholder="Ej. 11.809.440"
                     className={`w-full border border-gray-300 rounded p-1.5 focus:ring-1 focus:ring-emerald-500 font-medium ${getFieldHighlightClass('supervisorDocumento')}`}
                   />
                   {renderCommentAlert('supervisorDocumento')}

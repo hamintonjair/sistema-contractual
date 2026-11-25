@@ -1267,8 +1267,8 @@ export const supabaseService = {
             fechaPoliza: cont?.fecha_aprobacion_poliza || '',
             fechaInicio: cont?.fecha_inicio || '',
             fechaTerminacion: cont?.fecha_terminacion || '',
-            supervisorNombre: cont?.supervisor_nombre || '',
-            supervisorDocumento: cont?.supervisor_documento || '',
+            supervisorNombre: (!cont?.supervisor_nombre || cont.supervisor_nombre.toUpperCase().includes('DIANA ANDREA')) ? 'JUAN JOSÉ PINO MOSQUERA' : cont.supervisor_nombre,
+            supervisorDocumento: (!cont?.supervisor_documento || String(cont.supervisor_documento).replace(/\D/g, '') === '35602521') ? '11.809.440' : cont.supervisor_documento,
             apoyoSupervisionNombre: cont?.apoyo_supervision_nombre || '',
             apoyoSupervisionDocumento: cont?.apoyo_supervision_documento || '',
             createdAt: row.created_at || new Date().toISOString(),
@@ -1486,8 +1486,8 @@ export const supabaseService = {
           plazo_meses: (contractorData as any).plazoMeses ? Number((contractorData as any).plazoMeses) : 6,
           fecha_inicio: parseDateForPg(contractorData.fechaInicio) || '2026-01-15',
           fecha_terminacion: parseDateForPg(contractorData.fechaTerminacion) || '2026-07-14',
-          supervisor_nombre: contractorData.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA',
-          supervisor_documento: contractorData.supervisorDocumento || '35602521',
+          supervisor_nombre: (!contractorData.supervisorNombre || contractorData.supervisorNombre.toUpperCase().includes('DIANA ANDREA')) ? 'JUAN JOSÉ PINO MOSQUERA' : contractorData.supervisorNombre,
+          supervisor_documento: (!contractorData.supervisorDocumento || String(contractorData.supervisorDocumento).replace(/\D/g, '') === '35602521') ? '11.809.440' : contractorData.supervisorDocumento,
           apoyo_supervision_nombre: contractorData.apoyoSupervisionNombre && contractorData.apoyoSupervisionNombre !== 'N/A' ? contractorData.apoyoSupervisionNombre : null,
           apoyo_supervision_documento: contractorData.apoyoSupervisionDocumento && contractorData.apoyoSupervisionDocumento !== 'N/A' ? contractorData.apoyoSupervisionDocumento : null,
           numero_cuenta: contractorData.numeroCuenta || '',
@@ -2115,8 +2115,8 @@ export const supabaseService = {
           ciudadCuenta: cont?.ciudad || ciudadFromReport || '',
           fechaRegistroPresupuestal: fechaRegistroFromReport || '',
           codigoRubro: codigoRubroFromReport || '',
-          supervisorNombre: cont?.supervisor_nombre || '',
-          supervisorDocumento: cont?.supervisor_documento || '',
+          supervisorNombre: (!cont?.supervisor_nombre || cont.supervisor_nombre.toUpperCase().includes('DIANA ANDREA')) ? 'JUAN JOSÉ PINO MOSQUERA' : cont.supervisor_nombre,
+          supervisorDocumento: (!cont?.supervisor_documento || String(cont.supervisor_documento).replace(/\D/g, '') === '35602521') ? '11.809.440' : cont.supervisor_documento,
         };
       }
     } catch (err) {
@@ -2211,8 +2211,14 @@ export const supabaseService = {
         plazo_meses: parsePlazoToMeses(report.plazo),
         fecha_inicio: parseDateForPg(report.fechaInicio, '2026-01-15') || '2026-01-15',
         fecha_terminacion: parseDateForPg(report.fechaTerminacion, '2026-07-14') || '2026-07-14',
-        supervisor_nombre: report.supervisorNombre || user?.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA',
-        supervisor_documento: report.supervisorDocumento || user?.supervisorDocumento || '35.602.521',
+        supervisor_nombre: (() => {
+          const rawName = report.supervisorNombre || user?.supervisorNombre || 'JUAN JOSÉ PINO MOSQUERA';
+          return rawName.toUpperCase().includes('DIANA ANDREA') ? 'JUAN JOSÉ PINO MOSQUERA' : rawName;
+        })(),
+        supervisor_documento: (() => {
+          const rawDoc = report.supervisorDocumento || user?.supervisorDocumento || '11.809.440';
+          return String(rawDoc).replace(/\D/g, '') === '35602521' ? '11.809.440' : rawDoc;
+        })(),
         apoyo_supervision_nombre: report.apoyoSupervisionNombre && report.apoyoSupervisionNombre !== 'N/A' ? report.apoyoSupervisionNombre : null,
         apoyo_supervision_documento: report.apoyoSupervisionDocumento && report.apoyoSupervisionDocumento !== 'N/A' ? report.apoyoSupervisionDocumento : null,
         numero_cuenta: report.numeroCuenta || user?.numeroCuenta || '',
@@ -2498,8 +2504,8 @@ export const supabaseService = {
           contratistaDocumento: docIdentidad,
           contratistaCorreo: row.contratos?.profiles?.email || '',
           contratistaTelefono: row.contratos?.profiles?.telefono || '',
-          supervisorNombre: row.contratos?.supervisor_nombre || 'DIANA ANDREA MOSQUERA GARCIA',
-          supervisorDocumento: row.contratos?.supervisor_documento || '35.602.521',
+          supervisorNombre: (!row.contratos?.supervisor_nombre || String(row.contratos.supervisor_nombre).toUpperCase().includes('DIANA ANDREA')) ? 'JUAN JOSÉ PINO MOSQUERA' : row.contratos.supervisor_nombre,
+          supervisorDocumento: (!row.contratos?.supervisor_documento || String(row.contratos.supervisor_documento).replace(/\D/g, '') === '35602521') ? '11.809.440' : row.contratos.supervisor_documento,
           apoyoSupervisionNombre: row.contratos?.apoyo_supervision_nombre || 'N/A',
           apoyoSupervisionDocumento: row.contratos?.apoyo_supervision_documento || 'N/A',
           valorContrato: formatColombianCurrency(row.contratos?.valor_contrato || '20029800'),
@@ -2691,8 +2697,8 @@ export const supabaseService = {
               contratistaDocumento: docIdentidad,
               contratistaCorreo: row.contratos?.profiles?.email || '',
               contratistaTelefono: row.contratos?.profiles?.telefono || '',
-              supervisorNombre: row.contratos?.supervisor_nombre || 'DIANA ANDREA MOSQUERA GARCIA',
-              supervisorDocumento: row.contratos?.supervisor_documento || '35.602.521',
+              supervisorNombre: (!row.contratos?.supervisor_nombre || String(row.contratos.supervisor_nombre).toUpperCase().includes('DIANA ANDREA')) ? 'JUAN JOSÉ PINO MOSQUERA' : row.contratos.supervisor_nombre,
+              supervisorDocumento: (!row.contratos?.supervisor_documento || String(row.contratos.supervisor_documento).replace(/\D/g, '') === '35602521') ? '11.809.440' : row.contratos.supervisor_documento,
               apoyoSupervisionNombre: row.contratos?.apoyo_supervision_nombre || 'N/A',
               apoyoSupervisionDocumento: row.contratos?.apoyo_supervision_documento || 'N/A',
               valorContrato: formatColombianCurrency(row.contratos?.valor_contrato || '20029800'),
@@ -2803,8 +2809,8 @@ export const supabaseService = {
             crp_nro: report.crpNro || '191',
             poliza_nro: report.polizaNro && report.polizaNro !== 'N/A' ? report.polizaNro : null,
             fecha_aprobacion_poliza: parseDateForContract(report.fechaPoliza, '2026-01-15'),
-            supervisor_nombre: report.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA',
-            supervisor_documento: report.supervisorDocumento || '35.602.521',
+            supervisor_nombre: (!report.supervisorNombre || report.supervisorNombre.toUpperCase().includes('DIANA ANDREA')) ? 'JUAN JOSÉ PINO MOSQUERA' : report.supervisorNombre,
+            supervisor_documento: (!report.supervisorDocumento || String(report.supervisorDocumento).replace(/\D/g, '') === '35602521') ? '11.809.440' : report.supervisorDocumento,
             apoyo_supervision_nombre: report.apoyoSupervisionNombre && report.apoyoSupervisionNombre !== 'N/A' ? report.apoyoSupervisionNombre : null,
             apoyo_supervision_documento: report.apoyoSupervisionDocumento && report.apoyoSupervisionDocumento !== 'N/A' ? report.apoyoSupervisionDocumento : null,
             numero_cuenta: report.numeroCuenta || user?.numeroCuenta || '',

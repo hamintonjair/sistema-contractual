@@ -321,7 +321,11 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
   const [newFechaPoliza, setNewFechaPoliza] = useState(convertDDMMYYYYtoYYYYMMDD(user.fechaPoliza));
 
   // Datos del Administrador / Supervisor (SIEMPRE se cargan en el primer informe)
-  const [newSupervisorNombre, setNewSupervisorNombre] = useState(user.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA');
+  const [newSupervisorNombre, setNewSupervisorNombre] = useState(
+    user.supervisorNombre && user.supervisorNombre !== 'DIANA ANDREA MOSQUERA GARCIA'
+      ? user.supervisorNombre
+      : 'JUAN JOSÉ PINO MOSQUERA'
+  );
   const [newSecretariaNombre, setNewSecretariaNombre] = useState(user.secretariaNombre || 'Secretaría de Inclusión y Cohesión Social');
   const [newSecretariaCodigo, setNewSecretariaCodigo] = useState(user.secretariaCodigo || '170');
 
@@ -351,7 +355,8 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
       setNewPlazo(lastReport.plazo || user.plazo || '');
       setNewFechaInicio(convertDDMMYYYYtoYYYYMMDD(lastReport.fechaInicio || user.fechaInicio));
       setNewFechaTerminacion(convertDDMMYYYYtoYYYYMMDD(lastReport.fechaTerminacion || user.fechaTerminacion));
-      setNewSupervisorNombre(lastReport.supervisorNombre || user.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA');
+      const resolvedSupName = lastReport.supervisorNombre || user.supervisorNombre || 'JUAN JOSÉ PINO MOSQUERA';
+      setNewSupervisorNombre(resolvedSupName === 'DIANA ANDREA MOSQUERA GARCIA' ? 'JUAN JOSÉ PINO MOSQUERA' : resolvedSupName);
       setNewSecretariaNombre(lastReport.secretariaNombre || user.secretariaNombre || 'Secretaría de Inclusión y Cohesión Social');
       setNewSecretariaCodigo(lastReport.secretariaCodigo || user.secretariaCodigo || '170');
       setNewPolizaNro(lastReport.polizaNro || user.polizaNro || '');
@@ -378,7 +383,11 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
       setNewFechaPoliza(convertDDMMYYYYtoYYYYMMDD(user.fechaPoliza));
 
       // Datos de Administración y Supervisión: SI O SI cargan siempre
-      setNewSupervisorNombre(user.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA');
+      setNewSupervisorNombre(
+        user.supervisorNombre && user.supervisorNombre !== 'DIANA ANDREA MOSQUERA GARCIA'
+          ? user.supervisorNombre
+          : 'JUAN JOSÉ PINO MOSQUERA'
+      );
       setNewSecretariaNombre(user.secretariaNombre || 'Secretaría de Inclusión y Cohesión Social');
       setNewSecretariaCodigo(user.secretariaCodigo || '170');
 
@@ -664,8 +673,8 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
           plazo: newPlazo ? formatPlazoLetraYNumero(newPlazo) : (user.plazo || ''),
           fechaInicio: formatDateToDDMMYYYY(newFechaInicio) || user.fechaInicio || '',
           fechaTerminacion: formatDateToDDMMYYYY(newFechaTerminacion) || user.fechaTerminacion || '',
-          supervisorNombre: newSupervisorNombre || user.supervisorNombre || '',
-          supervisorDocumento: user.supervisorDocumento || '',
+          supervisorNombre: newSupervisorNombre || user.supervisorNombre || 'JUAN JOSÉ PINO MOSQUERA',
+          supervisorDocumento: (!user.supervisorDocumento || user.supervisorDocumento.replace(/\D/g, '') === '35602521') ? '11.809.440' : user.supervisorDocumento,
           apoyoSupervisionNombre: user.apoyoSupervisionNombre || '',
           apoyoSupervisionDocumento: user.apoyoSupervisionDocumento || '',
           secretariaNombre: newSecretariaNombre || user.secretariaNombre || '',
@@ -694,8 +703,11 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
           plazo: newPlazo ? formatPlazoLetraYNumero(newPlazo) : (lastSavedReport.plazo || user.plazo || ''),
           fechaInicio: formatDateToDDMMYYYY(newFechaInicio) || lastSavedReport.fechaInicio || user.fechaInicio || '',
           fechaTerminacion: formatDateToDDMMYYYY(newFechaTerminacion) || lastSavedReport.fechaTerminacion || user.fechaTerminacion || '',
-          supervisorNombre: newSupervisorNombre || lastSavedReport.supervisorNombre || user.supervisorNombre || '',
-          supervisorDocumento: user.supervisorDocumento || lastSavedReport.supervisorDocumento || '',
+          supervisorNombre: newSupervisorNombre || lastSavedReport.supervisorNombre || user.supervisorNombre || 'JUAN JOSÉ PINO MOSQUERA',
+          supervisorDocumento: (() => {
+            const rawDoc = lastSavedReport.supervisorDocumento || user.supervisorDocumento || '11.809.440';
+            return rawDoc.replace(/\D/g, '') === '35602521' ? '11.809.440' : rawDoc;
+          })(),
           apoyoSupervisionNombre: user.apoyoSupervisionNombre || lastSavedReport.apoyoSupervisionNombre || '',
           apoyoSupervisionDocumento: user.apoyoSupervisionDocumento || lastSavedReport.apoyoSupervisionDocumento || '',
           secretariaNombre: newSecretariaNombre || lastSavedReport.secretariaNombre || user.secretariaNombre || '',
@@ -958,7 +970,8 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
 
   const activeContractNro = user.contratoNro || reportsList[0]?.contratoNro || '';
   const activeValor = user.valorContrato || reportsList[0]?.valorContrato || '$ 20.029.800';
-  const activeSupervisor = user.supervisorNombre || reportsList[0]?.supervisorNombre || 'DIANA ANDREA MOSQUERA GARCIA';
+  const rawActiveSupervisor = reportsList[0]?.supervisorNombre || user.supervisorNombre || 'JUAN JOSÉ PINO MOSQUERA';
+  const activeSupervisor = rawActiveSupervisor === 'DIANA ANDREA MOSQUERA GARCIA' ? 'JUAN JOSÉ PINO MOSQUERA' : rawActiveSupervisor;
 
   // Paginación de Informes del Contratista
   const totalPages = Math.ceil(reportsList.length / pageSize) || 1;
@@ -2785,7 +2798,7 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
                       required
                       value={newSupervisorNombre}
                       onChange={(e) => setNewSupervisorNombre(e.target.value)}
-                      placeholder="Ej. DIANA ANDREA MOSQUERA GARCIA"
+                      placeholder="Ej. JUAN JOSÉ PINO MOSQUERA"
                       className="w-full border border-slate-300 rounded-xl p-2 text-xs font-medium focus:ring-2 focus:ring-emerald-500 focus:outline-none"
                     />
                   </div>
