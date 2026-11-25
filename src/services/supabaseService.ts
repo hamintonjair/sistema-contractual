@@ -4366,6 +4366,22 @@ export const supabaseService = {
     pagoNro: string = '1'
   ): Promise<any | null> {
     const cleanDoc = docIdentidad ? docIdentidad.replace(/\D/g, '') : '';
+    const sanitizeDeclaracionForm = (form: any, rowId?: string) => {
+      if (!form || typeof form !== 'object') return form;
+      if (typeof form.senores === 'string' && (form.senores.includes('\\n') || form.senores.includes('\\r'))) {
+        const cleanedSenores = form.senores.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+        const cleanedForm = { ...form, senores: cleanedSenores };
+        if (rowId) {
+          supabase
+            .from('declaraciones_renta')
+            .update({ datos_formulario: cleanedForm })
+            .eq('id', rowId)
+            .then();
+        }
+        return cleanedForm;
+      }
+      return form;
+    };
 
     try {
       if (informeId && isUuid(informeId)) {
@@ -4375,7 +4391,7 @@ export const supabaseService = {
           .eq('informe_id', informeId)
           .limit(1)
           .maybeSingle();
-        if (!error && data?.datos_formulario) return data.datos_formulario;
+        if (!error && data?.datos_formulario) return sanitizeDeclaracionForm(data.datos_formulario, data.id);
       }
 
       if (docIdentidad || cleanDoc) {
@@ -4393,7 +4409,7 @@ export const supabaseService = {
           .limit(1)
           .maybeSingle();
 
-        if (!error && data?.datos_formulario) return data.datos_formulario;
+        if (!error && data?.datos_formulario) return sanitizeDeclaracionForm(data.datos_formulario, data.id);
 
         // Fallback: Buscar la última declaración de este contratista independientemente del pago
         const { data: latestData } = await supabase
@@ -4404,7 +4420,7 @@ export const supabaseService = {
           .limit(1)
           .maybeSingle();
 
-        if (latestData?.datos_formulario) return latestData.datos_formulario;
+        if (latestData?.datos_formulario) return sanitizeDeclaracionForm(latestData.datos_formulario, latestData.id);
       }
     } catch (e) {
       console.warn('Error fetching declaracion renta:', e);
@@ -4420,7 +4436,7 @@ export const supabaseService = {
       for (const k of keysToTry) {
         const saved = localStorage.getItem(k);
         if (saved) {
-          try { return JSON.parse(saved); } catch (e) {}
+          try { return sanitizeDeclaracionForm(JSON.parse(saved)); } catch (e) {}
         }
       }
     }

@@ -23,7 +23,12 @@ interface DeclaracionRentaDocProps {
 
 const normalizeSenores = (val: string | undefined): string => {
   if (!val || !val.trim()) return 'Señores\nALCALDIA\nCiudad.';
-  const trimmed = val.trim();
+  // Convertir secuencias literales "\n" o "\r\n" (provenientes de JSON escapado en BD) en saltos de línea reales
+  const unescaped = val
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\r\n/g, '\n');
+  const trimmed = unescaped.trim();
   if (!trimmed.toLowerCase().includes('señor') && !trimmed.toLowerCase().includes('senor')) {
     return `Señores\n${trimmed}`;
   }

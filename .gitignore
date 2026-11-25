@@ -8,5 +8,7 @@ coverage/
 !.env.example
 .aistudio/
 supabase/seed_data.sql
+supabase/backup_export_*.json
+supabase/migracion_*.sql
 /public/assets/aistudio/
 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ReportData, FieldComment } from '../types';
-import QuibdoLogo from './QuibdoLogo';
+import QuibdoLogo, { QUIBDO_LOGO_URL } from './QuibdoLogo';
 import { formatColombianCurrency, formatValorAdicion, formatPlazoLetraYNumero, formatDateSlash, formatFechaAplicacion } from '../utils/formatters';
 import { MessageSquare, AlertTriangle, Edit3, CheckCircle2 } from 'lucide-react';
 import FieldCommentModal from './FieldCommentModal';
@@ -317,7 +317,7 @@ export default function ReportPreview({
                 {!watermarkUrl && (
                   <div className="absolute inset-0 flex items-center justify-center pointer-events-none pb-4">
                     <img 
-                      src="https://rnkisljndrunbbuavwgl.supabase.co/storage/v1/object/public/anexos/logo/logo%20alcaldia.png" 
+                      src={QUIBDO_LOGO_URL} 
                       alt="Alcaldía de Quibdó" 
                       className="h-[80px] w-auto object-contain bg-transparent mix-blend-multiply"
                       crossOrigin="anonymous"

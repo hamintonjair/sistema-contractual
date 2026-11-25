@@ -28,8 +28,9 @@ interface Props {
 
 function parseObjetoConPeriodo(objetoTexto?: string): { objetoBase: string; periodoTexto: string } {
   if (!objetoTexto) return { objetoBase: '', periodoTexto: '' };
+  const cleaned = objetoTexto.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
   
-  const match = objetoTexto.match(/([\s\S]*?)(?:\n\s*|\s+)(CORRESPONDIENTE\s+AL\s+PERIODO[\s\S]*)$/i);
+  const match = cleaned.match(/([\s\S]*?)(?:\n\s*|\s+)(CORRESPONDIENTE\s+AL\s+PERIODO[\s\S]*)$/i);
   if (match) {
     return {
       objetoBase: match[1].trim(),
@@ -37,7 +38,7 @@ function parseObjetoConPeriodo(objetoTexto?: string): { objetoBase: string; peri
     };
   }
   return {
-    objetoBase: objetoTexto.trim(),
+    objetoBase: cleaned.trim(),
     periodoTexto: ''
   };
 }

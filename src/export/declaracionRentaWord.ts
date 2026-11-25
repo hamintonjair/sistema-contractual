@@ -88,8 +88,11 @@ export async function exportDeclaracionRentaToWord(
   const firmaCedula = (data.firmaCedula || cedulaContratista).trim();
   const firmaExpedicion = (data.firmaExpedicion || expedicionCedula).trim();
 
-  // Parse senores lines
-  const rawSenores = data.senores || 'Señores\nALCALDIA\nCiudad.';
+  // Parse senores lines (handling any literal "\n" sequences from DB imports)
+  const rawSenores = (data.senores || 'Señores\nALCALDIA\nCiudad.')
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\r\n/g, '\n');
   const senoresLines = rawSenores.split('\n').map(l => l.trim()).filter(Boolean);
   const line0 = senoresLines[0] || 'Señores';
   const line1 = senoresLines[1] || 'ALCALDIA';

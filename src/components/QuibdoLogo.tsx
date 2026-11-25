@@ -1,10 +1,13 @@
 import React, { useState, useEffect } from 'react';
+import { SUPABASE_CONFIG } from '../config/supabaseConfig';
+
+const BASE_STORAGE_URL = `${SUPABASE_CONFIG.url.replace(/\/$/, '')}/storage/v1/object/public/anexos`;
 
 export const QUIBDO_LOGO_URLS = [
-  'https://rnkisljndrunbbuavwgl.supabase.co/storage/v1/object/public/anexos/logo/logo%20alcaldia.png',
-  'https://rnkisljndrunbbuavwgl.supabase.co/storage/v1/object/public/anexos/logo/logo.png',
-  'https://rnkisljndrunbbuavwgl.supabase.co/storage/v1/object/public/anexos/logo_alcaldia.png',
-  'https://rnkisljndrunbbuavwgl.supabase.co/storage/v1/object/public/anexos/logo.png',
+  `${BASE_STORAGE_URL}/logo/logo%20alcaldia.png`,
+  `${BASE_STORAGE_URL}/logo/logo.png`,
+  `${BASE_STORAGE_URL}/logo_alcaldia.png`,
+  `${BASE_STORAGE_URL}/logo.png`,
 ];
 export const QUIBDO_LOGO_URL = QUIBDO_LOGO_URLS[0];
 
