@@ -2868,7 +2868,7 @@ export const supabaseService = {
 
       const informePayload: any = {
         informe_nro: parseInt(report.informeNro, 10) || 1,
-        tipo_informe: report.tipoInforme || 'Mensual',
+        tipo_informe: String(report.tipoInforme || '').toLowerCase().includes('final') ? 'Final' : 'Mensual',
         fecha_presentacion: parseDateForPg(report.fechaPresentacion || report.periodoHasta, new Date().toISOString().split('T')[0]),
         periodo_desde: parseDateForPg(report.periodoDesde, '2026-07-01'),
         periodo_hasta: parseDateForPg(report.periodoHasta, '2026-07-31'),
@@ -3751,11 +3751,12 @@ export const supabaseService = {
 
       // Si no tenemos UUID de informe, buscar si existe informe por documento y número de pago
       if (!resolvedInformeId && (docKey || cleanDoc)) {
+        const docValues = Array.from(new Set([docKey, cleanDoc].filter(Boolean)));
         const { data: rep } = await supabase
           .from('informes_mensuales')
           .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
           .eq('informe_nro', parseInt(pagoNroStr, 10) || 1)
-          .or(`contratos.profiles.documento_identidad.eq.${docKey},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+          .in('contratos.profiles.documento_identidad', docValues)
           .limit(1)
           .maybeSingle();
 
@@ -4099,11 +4100,12 @@ export const supabaseService = {
       let contratoId: string | null = (contratoIdStr && isUuid(contratoIdStr)) ? contratoIdStr : null;
 
       if (!resolvedInformeId && (docKeyToUse || cleanDoc)) {
+        const docValues = Array.from(new Set([docKeyToUse, cleanDoc].filter(Boolean)));
         const { data: rep } = await supabase
           .from('informes_mensuales')
           .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
           .eq('informe_nro', parseInt(nroStr, 10) || 1)
-          .or(`contratos.profiles.documento_identidad.eq.${docKeyToUse},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+          .in('contratos.profiles.documento_identidad', docValues)
           .limit(1)
           .maybeSingle();
 
@@ -4285,11 +4287,12 @@ export const supabaseService = {
 
       if (!resolvedInformeId && (docKey || cleanDoc)) {
         try {
+          const docValues = Array.from(new Set([docKey, cleanDoc].filter(Boolean)));
           const { data: rep } = await supabase
             .from('informes_mensuales')
             .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
             .eq('informe_nro', parseInt(pagoNroStr, 10) || 1)
-            .or(`contratos.profiles.documento_identidad.eq.${docKey},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+            .in('contratos.profiles.documento_identidad', docValues)
             .limit(1)
             .maybeSingle();
 
@@ -4489,11 +4492,12 @@ export const supabaseService = {
 
       // Buscar si existe informe en DB por documento y número de pago
       if (!resolvedInformeId && (docKeyToUse || cleanDoc)) {
+        const docValues = Array.from(new Set([docKeyToUse, cleanDoc].filter(Boolean)));
         const { data: rep } = await supabase
           .from('informes_mensuales')
           .select('id, contrato_id, contratos!inner(id, profiles!inner(documento_identidad))')
           .eq('informe_nro', parseInt(nroStr, 10) || 1)
-          .or(`contratos.profiles.documento_identidad.eq.${docKeyToUse},contratos.profiles.documento_identidad.eq.${cleanDoc}`)
+          .in('contratos.profiles.documento_identidad', docValues)
           .limit(1)
           .maybeSingle();
 

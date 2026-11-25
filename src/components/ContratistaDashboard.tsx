@@ -2603,7 +2603,7 @@ export default function ContratistaDashboard({ user, onOpenReportEditor, onDirec
                       className="w-full border border-slate-300 rounded-xl p-2.5 text-xs bg-white focus:ring-2 focus:ring-emerald-500 focus:outline-none font-medium"
                     >
                       <option value="Mensual">Mensual</option>
-                      <option value="Final font-medium">Final</option>
+                      <option value="Final">Final</option>
                     </select>
                   </div>
 
