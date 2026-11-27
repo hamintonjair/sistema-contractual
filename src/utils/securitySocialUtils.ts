@@ -35,6 +35,10 @@ export const sanitizeCertificadoData = <T extends Partial<CertificadoSupervision
   if (!cert || typeof cert !== 'object') {
     return (cert || {}) as T;
   }
-  return { ...cert } as T;
+  const copy: any = { ...cert };
+  if (typeof copy.supervisorNombre === 'string' && copy.supervisorNombre.toUpperCase().includes('DIANA ANDREA MOSQUERA')) {
+    copy.supervisorNombre = 'JUAN JOSÉ PINO MOSQUERA';
+  }
+  return copy as T;
 };
 
